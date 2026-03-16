@@ -8,7 +8,7 @@ from datetime import datetime
 TELEGRAM_TOKEN = "8621482285:AAFXlOcgNwRQp1MMmYABaDLUXrXAoQgDplc"
 CHAT_ID        = "1343270628"
 BINANCE_BASE   = "https://api.binance.com/api/v3"
-MIN_SCORE      = 4
+MIN_SCORE      = 3
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD   = 30
 
