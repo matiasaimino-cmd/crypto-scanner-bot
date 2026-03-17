@@ -80,7 +80,7 @@ def detect_rsi_divergence(df, period=14):
         loss   = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
         rsi_full = 100 - 100 / (1 + gain / loss)
 
-        lookback   = 50  # ampliado de 30 a 50
+        lookback   = 100  # ampliado de 30 a 50
         recent_df  = df.iloc[-lookback:]
         recent_rsi = rsi_full.iloc[-lookback:]
 
@@ -495,7 +495,7 @@ if __name__ == "__main__":
         "Escaneando cada 15 minutos..."
     )
     scan_all()
-    schedule.every(15).minutes.do(scan_all)
+    schedule.every(5).minutes.do(scan_all)
     while True:
         schedule.run_pending()
         time.sleep(30)
