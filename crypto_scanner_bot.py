@@ -20,7 +20,7 @@ SYMBOLS = [
     "THETAUSDT","FTMUSDT","SANDUSDT","MANAUSDT","INJUSDT"
 ]
 
-INTERVALS = [("15m","Scalping 15m"),("1h","Day Trading 1H"),("4h","Swing 4H")]
+INTERVALS = [("15m","Scalping 15m"),("1h","Day Trading 1H")]
 
 def send_telegram(message):
     url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
@@ -326,8 +326,7 @@ def calc_score(direction, rsi, ob, fvg, structure, patterns, vol_high, near_sr, 
         if divergence == "BULLISH_DIV": score += 2; labels.append("Divergencia RSI alcista")
         if htf_bias == "BULLISH":
             score += 2; labels.append("HTF a favor (ALCISTA)")
-        elif htf_bias == "BEARISH" and not rsi_extreme_long:
-            score -= 1; labels.append("HTF en contra (BAJISTA)")
+        # HTF en contra no penaliza
     else:
         if rsi >= RSI_OVERBOUGHT: score += 2; labels.append("RSI sobrecomprado (" + str(rsi) + ")")
         if ob:    score += 2; labels.append("OB bajista " + fmt(ob["low"]) + "-" + fmt(ob["high"]))
@@ -338,8 +337,7 @@ def calc_score(direction, rsi, ob, fvg, structure, patterns, vol_high, near_sr, 
         if divergence == "BEARISH_DIV": score += 2; labels.append("Divergencia RSI bajista")
         if htf_bias == "BEARISH":
             score += 2; labels.append("HTF a favor (BAJISTA)")
-        elif htf_bias == "BULLISH" and not rsi_extreme_short:
-            score -= 1; labels.append("HTF en contra (ALCISTA)")
+        # HTF en contra no penaliza
 
     if vol_high:  score += 1; labels.append("Volumen elevado")
     if near_sr:   score += 0.5; labels.append("Precio en S/R clave")
