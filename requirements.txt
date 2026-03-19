@@ -2,3 +2,4 @@ requests
 pandas
 numpy
 schedule
+psycopg2-binary
