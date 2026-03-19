@@ -1,1 +1,1 @@
-worker: python crypto_scanner_bot.py
+worker: python crypto_scanner_bot_v2-1.py
