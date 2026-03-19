@@ -323,19 +323,51 @@ def get_htf_bias(symbol, interval):
 
 def calc_sr(df):
     try:
-        price = df["close"].iloc[-1]
-        ph, pl = [], []
-        for i in range(3, len(df) - 3):
-            w = df["high"].iloc[i-3:i+4]
-            if len(w) == 7 and df["high"].iloc[i] == w.max(): ph.append(df["high"].iloc[i])
-            w2 = df["low"].iloc[i-3:i+4]
-            if len(w2) == 7 and df["low"].iloc[i] == w2.min(): pl.append(df["low"].iloc[i])
-        res = sorted([h for h in ph if h > price])
-        sup = sorted([l for l in pl if l < price], reverse=True)
-        return (round(sup[0],6) if sup else round(price*0.98,6)), (round(res[0],6) if res else round(price*1.02,6))
+        price    = df["close"].iloc[-1]
+        recent   = df.iloc[-100:]  # Solo últimas 100 velas — más relevante
+        ph, pl   = [], []
+
+        # Método 1 — Pivots con ventana de 5 velas (más robusto que 3)
+        for i in range(5, len(recent) - 5):
+            w_h = recent["high"].iloc[i-5:i+6]
+            w_l = recent["low"].iloc[i-5:i+6]
+            if len(w_h) == 11 and recent["high"].iloc[i] == w_h.max():
+                ph.append(recent["high"].iloc[i])
+            if len(w_l) == 11 and recent["low"].iloc[i] == w_l.min():
+                pl.append(recent["low"].iloc[i])
+
+        # Método 2 — Agregar mínimo y máximo recientes (últimas 20 velas)
+        recent_20 = df.iloc[-20:]
+        pl.append(float(recent_20["low"].min()))
+        ph.append(float(recent_20["high"].max()))
+
+        # Método 3 — Agregar mínimo y máximo de sesión (últimas 50 velas)
+        recent_50 = df.iloc[-50:]
+        pl.append(float(recent_50["low"].min()))
+        ph.append(float(recent_50["high"].max()))
+
+        # Filtrar por lado del precio
+        sups = sorted([l for l in pl if l < price], reverse=True)
+        ress = sorted([h for h in ph if h > price])
+
+        # Clustering — agrupar niveles muy cercanos (dentro del 0.3%) y tomar el más reciente
+        def cluster(levels, tolerance=0.003):
+            if not levels: return levels
+            clustered = [levels[0]]
+            for l in levels[1:]:
+                if abs(l - clustered[-1]) / price > tolerance:
+                    clustered.append(l)
+            return clustered
+
+        sups = cluster(sups)
+        ress = cluster(ress)
+
+        sup = round(sups[0], 6) if sups else round(price * 0.98, 6)
+        res = round(ress[0], 6) if ress else round(price * 1.02, 6)
+        return sup, res
     except:
         price = df["close"].iloc[-1]
-        return round(price*0.98,6), round(price*1.02,6)
+        return round(price * 0.98, 6), round(price * 1.02, 6)
 
 def detect_ob(df):
     ob_bull, ob_bear = None, None
