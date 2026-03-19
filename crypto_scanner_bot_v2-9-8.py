@@ -607,7 +607,25 @@ def format_setup(s, tf_label):
         lines.append("⚠️ <b>REBOTE TÉCNICO — HTF en contra. TP corto, riesgo alto.</b>")
 
     lines += [
-        "💰 Precio:      " + fmt(s["price"]),
+        "💰 Precio actual: " + fmt(s["price"]),
+    ]
+
+    # Precio de entrada estimativo
+    ob = s.get("ob")
+    fvg = s.get("fvg")
+    if ob:
+        if is_long:
+            entrada = round((ob["high"] + ob["low"]) / 2, 6)
+        else:
+            entrada = round((ob["high"] + ob["low"]) / 2, 6)
+        lines.append("🎯 Entrada estimada: " + fmt(entrada) + " (zona OB)")
+    elif fvg:
+        entrada = round((fvg["high"] + fvg["low"]) / 2, 6)
+        lines.append("🎯 Entrada estimada: " + fmt(entrada) + " (zona FVG)")
+    else:
+        lines.append("🎯 Entrada estimada: " + fmt(s["price"]) + " (precio actual)")
+
+    lines += [
         "📊 RSI:         " + str(s["rsi"]),
         htf_emoji + " HTF Bias:    " + htf_label,
         "🌊 Volatilidad: " + str(s["volatility"]) + "%",
@@ -762,23 +780,7 @@ def scan_all():
     ts  = datetime.now(ARG_TZ).strftime("%d/%m %H:%M:%S")
     print("[" + now + "] Escaneando...")
 
-    all_setups, volatilities = [], []
-
-    # Calcular volatilidad primero — separado del analisis
-    for symbol in SYMBOLS:
-        try:
-            df = get_klines(symbol, "15m", 50)
-            if df is not None and len(df) > 5:
-                v = calc_volatility(df)
-                p = df["close"].iloc[-1]
-                volatilities.append({"symbol": symbol, "volatility": v, "price": p})
-                print("VOL " + symbol + ": " + str(v) + "% @ " + str(p))
-            else:
-                print("VOL FAIL " + symbol + " — df None o muy corto")
-        except Exception as e:
-            print("Error volatilidad " + symbol + ": " + str(e))
-        time.sleep(0.1)
-    print("Volatilidades calculadas: " + str(len(volatilities)) + "/" + str(len(SYMBOLS)))
+    all_setups = []
 
     for interval, tf_label in INTERVALS:
         for symbol in SYMBOLS:
@@ -793,9 +795,8 @@ def scan_all():
             time.sleep(0.15)
 
     all_setups.sort(key=lambda x: x["score"], reverse=True)
-    vol_sorted = sorted(volatilities, key=lambda x: x["volatility"], reverse=True)
 
-    msg = "🔍 <b>SCANNER v4.0 — " + now + "</b>\n"
+    msg = "🔍 <b>SCANNER v4.2 — " + now + "</b>\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
     msg += "📋 Activos: " + str(len(SYMBOLS)) + " x 2 TF | Setups: " + str(len(all_setups)) + "\n"
     msg += "⚙️ Score: " + str(MIN_SCORE) + "/10 | Cooldown: " + str(ALERTA_COOLDOWN_MIN) + "min\n"
@@ -816,11 +817,6 @@ def scan_all():
                 msg += format_setup(s, s["tf_label"]) + "\n"
     else:
         msg += "\n⏳ Sin setups ahora.\n"
-
-    msg += "\n━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "🔥 <b>RANKING VOLATILIDAD</b>\n"
-    for i, v in enumerate(vol_sorted, 1):
-        msg += str(i) + ". <b>" + v["symbol"] + "</b> — " + str(v["volatility"]) + "% | " + fmt(v["price"]) + "\n"
 
     msg += "\n🕐 " + ts
     msg += "\n⚠️ No es consejo financiero."
