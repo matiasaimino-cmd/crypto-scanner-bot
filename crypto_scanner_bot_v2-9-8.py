@@ -49,7 +49,7 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 symbol VARCHAR(20),
                 direction VARCHAR(10),
-                timeframe VARCHAR(10),
+                timeframe VARCHAR(20),
                 precio FLOAT,
                 rsi FLOAT,
                 score FLOAT,
@@ -66,7 +66,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS market_state (
                 id SERIAL PRIMARY KEY,
                 symbol VARCHAR(20),
-                timeframe VARCHAR(10),
+                timeframe VARCHAR(20),
                 rsi FLOAT,
                 estructura TEXT,
                 htf_bias TEXT,
@@ -80,13 +80,21 @@ def init_db():
             CREATE TABLE IF NOT EXISTS rsi_history (
                 id SERIAL PRIMARY KEY,
                 symbol VARCHAR(20),
-                timeframe VARCHAR(10),
+                timeframe VARCHAR(20),
                 rsi FLOAT,
                 precio FLOAT,
                 registrado_at TIMESTAMP DEFAULT NOW()
             )
         """)
         conn.commit()
+        # Ampliar campos VARCHAR por si las tablas ya existían con tamaño menor
+        try:
+            cur.execute("ALTER TABLE alertas ALTER COLUMN timeframe TYPE VARCHAR(20)")
+            cur.execute("ALTER TABLE market_state ALTER COLUMN timeframe TYPE VARCHAR(20)")
+            cur.execute("ALTER TABLE rsi_history ALTER COLUMN timeframe TYPE VARCHAR(20)")
+            conn.commit()
+        except:
+            conn.rollback()
         print("DB iniciada OK")
     except Exception as e:
         print("Error init DB: " + str(e))
