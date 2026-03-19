@@ -610,21 +610,6 @@ def format_setup(s, tf_label):
         "💰 Precio actual: " + fmt(s["price"]),
     ]
 
-    # Precio de entrada estimativo
-    ob = s.get("ob")
-    fvg = s.get("fvg")
-    if ob:
-        if is_long:
-            entrada = round((ob["high"] + ob["low"]) / 2, 6)
-        else:
-            entrada = round((ob["high"] + ob["low"]) / 2, 6)
-        lines.append("🎯 Entrada estimada: " + fmt(entrada) + " (zona OB)")
-    elif fvg:
-        entrada = round((fvg["high"] + fvg["low"]) / 2, 6)
-        lines.append("🎯 Entrada estimada: " + fmt(entrada) + " (zona FVG)")
-    else:
-        lines.append("🎯 Entrada estimada: " + fmt(s["price"]) + " (precio actual)")
-
     lines += [
         "📊 RSI:         " + str(s["rsi"]),
         htf_emoji + " HTF Bias:    " + htf_label,
@@ -642,7 +627,6 @@ def format_setup(s, tf_label):
         lines.append("⬜ FVG:        " + fmt(s["fvg"]["low"]) + " - " + fmt(s["fvg"]["high"]) + (" (" + str(sz) + "%)" if sz else ""))
     if s["structure"]:
         lines.append("🔷 Estructura: " + s["structure"])
-    # Mostrar HH/LL si fue detectado
     hh_ll_type  = s.get("hh_ll_type")
     hh_ll_level = s.get("hh_ll_level")
     if hh_ll_type == "HH" and hh_ll_level:
@@ -654,10 +638,23 @@ def format_setup(s, tf_label):
         "🟢 Soporte:     " + fmt(s["support"]),
         "🔴 Resistencia: " + fmt(s["resistance"]),
         "━━━━━━━━━━━━━━━",
-        "🛑 SL:   " + fmt(s["sl"]),
-        "🎯 TP1:  " + fmt(s["tp1"]) + " (R:R 1:" + str(s["rr1"]) + ")",
-        "🎯 TP2:  " + fmt(s["tp2"]) + " (R:R 1:" + str(s["rr2"]) + ")",
-        "🎯 TP3:  " + fmt(s["tp3"]),
+    ]
+    # Entrada estimada junto al SL y TPs
+    ob  = s.get("ob")
+    fvg = s.get("fvg")
+    if ob:
+        entrada = round((ob["high"] + ob["low"]) / 2, 6)
+        lines.append("🟡 Entrada:  " + fmt(entrada) + " (zona OB)")
+    elif fvg:
+        entrada = round((fvg["high"] + fvg["low"]) / 2, 6)
+        lines.append("🟡 Entrada:  " + fmt(entrada) + " (zona FVG)")
+    else:
+        lines.append("🟡 Entrada:  " + fmt(s["price"]) + " (precio actual)")
+    lines += [
+        "🛑 SL:      " + fmt(s["sl"]),
+        "🎯 TP1:     " + fmt(s["tp1"]) + " (R:R 1:" + str(s["rr1"]) + ")",
+        "🎯 TP2:     " + fmt(s["tp2"]) + " (R:R 1:" + str(s["rr2"]) + ")",
+        "🎯 TP3:     " + fmt(s["tp3"]),
         "✅ Confluencias:",
     ]
     for l in s["labels"]:
