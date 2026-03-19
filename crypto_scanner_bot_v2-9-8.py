@@ -677,8 +677,8 @@ def analyze_symbol(symbol, interval):
         divergence   = detect_rsi_divergence(df)
         htf_bias     = get_htf_bias(symbol, interval)
         hh_ll_type, hh_ll_level = detect_hh_ll(df)
-        near_sup     = abs(price - sup) / price < 0.005
-        near_res     = abs(price - res) / price < 0.005
+        near_sup     = abs(price - sup) / price < 0.01   # 1% — más amplio para detectar soporte cercano
+        near_res     = abs(price - res) / price < 0.01   # 1% — más amplio para detectar resistencia cercana
 
         # Guardar estado y RSI en DB
         guardar_estado(symbol, interval, rsi, structure, htf_bias, divergence, price)
@@ -704,6 +704,9 @@ def analyze_symbol(symbol, interval):
             velas_alcistas = [p for p in candles if "alcista" in p]
             if direction == "LONG"  and velas_bajistas: continue
             if direction == "SHORT" and velas_alcistas: continue
+            # Filtro divergencia — divergencia contraria bloquea la señal
+            if direction == "SHORT" and divergence == "BULLISH_DIV": continue
+            if direction == "LONG"  and divergence == "BEARISH_DIV": continue
             # Filtro estructura — BOS contrario bloquea la señal
             if direction == "LONG"  and structure in ("BOS_BEAR", "CHoCH_BEAR"): continue
             if direction == "SHORT" and structure in ("BOS_BULL", "CHoCH_BULL"): continue
