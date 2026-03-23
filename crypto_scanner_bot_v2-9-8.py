@@ -402,6 +402,50 @@ def get_htf_bias(symbol, interval):
         return "NEUTRAL"
 
 
+def get_1h_bias(symbol):
+    """
+    Sesgo del 1H — usado como filtro intermedio para trades de 15m.
+    Más rápido que get_htf_bias, solo evalúa estructura de mercado reciente.
+    Retorna: BULLISH | BEARISH | NEUTRAL
+    """
+    try:
+        df = get_klines(symbol, "1h", limit=50)
+        if df is None: return "NEUTRAL"
+
+        closes = df["close"]
+        price  = closes.iloc[-1]
+        ema50  = closes.ewm(span=50, adjust=False, min_periods=20).mean().iloc[-1]
+
+        bull, bear = 0, 0
+        if price > ema50: bull += 1
+        else:             bear += 1
+
+        # Estructura de las últimas 50 velas en 1H
+        highs, lows = [], []
+        for i in range(2, len(df) - 2):
+            if df["high"].iloc[i] > df["high"].iloc[i-1] and df["high"].iloc[i] > df["high"].iloc[i+1]:
+                highs.append(df["high"].iloc[i])
+            if df["low"].iloc[i]  < df["low"].iloc[i-1]  and df["low"].iloc[i]  < df["low"].iloc[i+1]:
+                lows.append(df["low"].iloc[i])
+        if len(highs) >= 2 and len(lows) >= 2:
+            if highs[-1] > highs[-2] and lows[-1] > lows[-2]:   bull += 2
+            elif highs[-1] < highs[-2] and lows[-1] < lows[-2]: bear += 2
+
+        # CHoCH reciente en 1H — muy importante para detectar cambios de tendencia
+        if len(highs) >= 2 and len(lows) >= 2:
+            lh = highs[-1][1] if isinstance(highs[-1], tuple) else highs[-1]
+            ll = lows[-1][1]  if isinstance(lows[-1], tuple)  else lows[-1]
+            lc = df["close"].iloc[-1]
+            if lc > lh: bull += 1  # Rompió resistencia → alcista
+            if lc < ll: bear += 1  # Rompió soporte → bajista
+
+        if bull > bear:   return "BULLISH"
+        elif bear > bull: return "BEARISH"
+        return "NEUTRAL"
+    except:
+        return "NEUTRAL"
+
+
 def calc_sr(df):
     """
     Soporte y resistencia más cercanos al precio.
@@ -516,6 +560,7 @@ def detect_structure(df):
     Cambios de estructura de mercado.
     BOS  (Break of Structure): ruptura en dirección de tendencia.
     CHoCH (Change of Character): ruptura contra tendencia — posible reversión.
+    Verifica la vela actual Y las últimas 5 velas para no perder CHoCH recientes.
     Solo considera niveles de las últimas 50 velas.
     """
     try:
@@ -530,14 +575,20 @@ def detect_structure(df):
 
         lh, ph        = highs[-1][1], highs[-2][1]
         ll, pl        = lows[-1][1],  lows[-2][1]
-        lc, pc        = df["close"].iloc[-1], df["close"].iloc[-2]
         last_high_idx = highs[-1][0]
         last_low_idx  = lows[-1][0]
 
-        if lc > lh and pc <= lh and (len(df) - last_high_idx) <= 50:
-            return "BOS_BULL" if lh > ph else "CHoCH_BULL"
-        if lc < ll and pc >= ll and (len(df) - last_low_idx) <= 50:
-            return "BOS_BEAR" if ll < pl else "CHoCH_BEAR"
+        # Verificar las últimas 5 velas en vez de solo la última
+        # Esto detecta CHoCH que ocurrió recientemente pero no en la vela actual
+        for lookback in range(1, 6):
+            if lookback >= len(df): break
+            lc = df["close"].iloc[-lookback]
+            pc = df["close"].iloc[-lookback-1] if lookback+1 < len(df) else lc
+
+            if lc > lh and pc <= lh and (len(df) - last_high_idx) <= 50:
+                return "BOS_BULL" if lh > ph else "CHoCH_BULL"
+            if lc < ll and pc >= ll and (len(df) - last_low_idx) <= 50:
+                return "BOS_BEAR" if ll < pl else "CHoCH_BEAR"
     except:
         pass
     return None
@@ -832,6 +883,8 @@ def analyze_symbol(symbol, interval):
         vol                     = calc_volatility(df)
         divergence              = detect_rsi_divergence(df)
         htf_bias                = get_htf_bias(symbol, interval)
+        # Para trades de 15m: también verificar el 1H como filtro intermedio
+        bias_1h                 = get_1h_bias(symbol) if interval == "15m" else None
         hh_ll_type, hh_ll_level = detect_hh_ll(df)
         near_sup                = abs(price - sup) / price < 0.01
         near_res                = abs(price - res) / price < 0.01
@@ -854,6 +907,13 @@ def analyze_symbol(symbol, interval):
                           (direction == "LONG"  and rsi <= (100-RSI_EXTREME))
             if direction == "SHORT" and htf_bias == "BULLISH" and not rsi_extremo: continue
             if direction == "LONG"  and htf_bias == "BEARISH" and not rsi_extremo: continue
+
+            # 3. Filtro 1H intermedio para trades de 15m
+            # Para shortear en 15m: el 1H también debe ser bajista (o neutro)
+            # Para longear en 15m: el 1H también debe ser alcista (o neutro)
+            if bias_1h is not None and not rsi_extremo:
+                if direction == "SHORT" and bias_1h == "BULLISH": continue
+                if direction == "LONG"  and bias_1h == "BEARISH": continue
 
             # 3. Score y tipo de setup
             score, labels = calc_score(direction, rsi, ob, fvg, structure, candles, vol_h, near, divergence, htf_bias)
