@@ -1082,6 +1082,52 @@ def resumen_diario():
         msg += " — " + enviada_at.strftime("%d/%m %H:%M") + "\n"
     send_telegram(msg)
 
+def get_telegram_updates(offset=None):
+    """Obtiene mensajes nuevos de Telegram"""
+    try:
+        url    = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/getUpdates"
+        params = {"timeout": 5}
+        if offset: params["offset"] = offset
+        r = requests.get(url, params=params, timeout=10)
+        return r.json().get("result", [])
+    except:
+        return []
+
+
+def procesar_comandos(last_update_id):
+    """
+    Procesa comandos enviados al bot por Telegram.
+    Comandos disponibles:
+    /resumen  → manda el resumen de las últimas 20 alertas
+    /scan     → fuerza un escaneo inmediato
+    /ayuda    → muestra los comandos disponibles
+    """
+    updates = get_telegram_updates(offset=last_update_id)
+    for update in updates:
+        last_update_id = update["update_id"] + 1
+        msg = update.get("message", {})
+        text = msg.get("text", "").strip().lower()
+        chat = str(msg.get("chat", {}).get("id", ""))
+
+        if chat != CHAT_ID: continue  # Ignorar mensajes de otros chats
+
+        if text == "/resumen":
+            print("Comando /resumen recibido")
+            resumen_diario()
+        elif text == "/scan":
+            print("Comando /scan recibido")
+            send_telegram("🔄 Iniciando escaneo manual...")
+            scan_all()
+        elif text == "/ayuda":
+            send_telegram(
+                "🤖 <b>Comandos disponibles:</b>\n\n"
+                "/resumen — últimas 20 alertas\n"
+                "/scan    — escaneo inmediato\n"
+                "/ayuda   — esta ayuda"
+            )
+
+    return last_update_id
+
 # =============================================================================
 #   INICIO
 # =============================================================================
@@ -1099,11 +1145,15 @@ if __name__ == "__main__":
         "— calc_sr mejorado con clustering\n\n"
         "⚙️ Score mínimo: " + str(MIN_SCORE) + "/10\n"
         "⏱ Cooldown: " + str(ALERTA_COOLDOWN_MIN) + " minutos\n"
-        "🔄 Escaneo cada 5 minutos"
+        "🔄 Escaneo cada 5 minutos\n\n"
+        "💬 Comandos: /resumen | /scan | /ayuda"
     )
     scan_all()
     schedule.every(5).minutes.do(scan_all)
     schedule.every().day.at("08:00").do(resumen_diario)
+
+    last_update_id = None
     while True:
         schedule.run_pending()
+        last_update_id = procesar_comandos(last_update_id)
         time.sleep(30)
