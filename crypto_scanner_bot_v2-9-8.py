@@ -31,7 +31,7 @@ RSI_EXTREME         = 75    # RSI extremo — permite operar contra HTF (inverso
 ALERTA_COOLDOWN_MIN = 30    # Minutos entre alertas del mismo par/dirección
 
 SYMBOLS = [
-    "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "XRPUSDT",  "BNBUSDT",
+    "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "XRPUSDT",  "COTIUSDT",
     "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "DOTUSDT",   "PEPEUSDT",
     "ROSEUSDT", "RENDERUSDT",  "ATOMUSDT", "NEARUSDT",  "HBARUSDT",
     "THETAUSDT","FTMUSDT",  "SANDUSDT", "MANAUSDT",  "OPUSDT"
