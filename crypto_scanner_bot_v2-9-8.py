@@ -24,7 +24,7 @@ TELEGRAM_TOKEN      = "8621482285:AAFXlOcgNwRQp1MMmYABaDLUXrXAoQgDplc"
 CHAT_ID             = "1343270628"
 BINANCE_BASE        = "https://api.binance.com/api/v3"
 
-MIN_SCORE           = 6     # Score mínimo para enviar alerta
+MIN_SCORE           = 3     # Score mínimo para enviar alerta
 RSI_OVERBOUGHT      = 70    # RSI sobrecomprado
 RSI_OVERSOLD        = 30    # RSI sobrevendido
 RSI_EXTREME         = 75    # RSI extremo — permite operar contra HTF
@@ -360,7 +360,48 @@ def detect_rsi_divergence(df, period=14):
         return None
 
 
-def get_htf_bias(symbol, interval):
+def get_btc_momentum(interval):
+    """
+    Detecta el momentum actual de BTC para filtrar altcoins correlacionadas.
+    Si BTC está en impulso alcista → no dar SHORTs en altcoins.
+    Si BTC está en impulso bajista → no dar LONGs en altcoins.
+
+    Lógica:
+    - Compara el cierre actual vs cierre de hace 3 velas (momentum de corto plazo)
+    - Verifica si el precio está por encima o debajo de EMA20
+    - Retorna: BULLISH | BEARISH | NEUTRAL
+    """
+    try:
+        df = get_klines("BTCUSDT", interval, limit=30)
+        if df is None: return "NEUTRAL"
+
+        price   = df["close"].iloc[-1]
+        prev3   = df["close"].iloc[-4]   # Precio hace 3 velas
+        ema20   = df["close"].ewm(span=20, adjust=False, min_periods=10).mean().iloc[-1]
+
+        # Cambio porcentual en las últimas 3 velas
+        cambio = (price - prev3) / prev3 * 100
+
+        bull, bear = 0, 0
+
+        # Momentum de precio — umbral 0.3% para evitar ruido
+        if cambio > 0.3:  bull += 2
+        elif cambio < -0.3: bear += 2
+
+        # Posición respecto a EMA20
+        if price > ema20: bull += 1
+        else:             bear += 1
+
+        # Vela actual — si es alcista o bajista
+        last_candle = df.iloc[-1]
+        if last_candle["close"] > last_candle["open"]: bull += 1
+        else:                                          bear += 1
+
+        if bull > bear:   return "BULLISH"
+        elif bear > bull: return "BEARISH"
+        return "NEUTRAL"
+    except:
+        return "NEUTRAL"
     """
     Sesgo del marco temporal mayor (HTF).
     Para 15m/1h usa 4H. Evalúa EMA50, EMA200 y estructura.
@@ -885,6 +926,9 @@ def analyze_symbol(symbol, interval):
         htf_bias                = get_htf_bias(symbol, interval)
         # Para trades de 15m: también verificar el 1H como filtro intermedio
         bias_1h                 = get_1h_bias(symbol) if interval == "15m" else None
+        # Momentum de BTC — no shortear altcoins si BTC está subiendo y viceversa
+        # No aplicar a BTCUSDT mismo
+        btc_momentum            = get_btc_momentum(interval) if symbol != "BTCUSDT" else "NEUTRAL"
         hh_ll_type, hh_ll_level = detect_hh_ll(df)
         near_sup                = abs(price - sup) / price < 0.01
         near_res                = abs(price - res) / price < 0.01
@@ -915,20 +959,26 @@ def analyze_symbol(symbol, interval):
                 if direction == "SHORT" and bias_1h == "BULLISH": continue
                 if direction == "LONG"  and bias_1h == "BEARISH": continue
 
-            # 3. Score y tipo de setup
+            # 4. Filtro correlación BTC — no shortear altcoins si BTC está en impulso alcista
+            # No aplicar si RSI extremo ni a BTCUSDT mismo
+            if not rsi_extremo:
+                if direction == "SHORT" and btc_momentum == "BULLISH": continue
+                if direction == "LONG"  and btc_momentum == "BEARISH": continue
+
+            # 5. Score y tipo de setup
             score, labels = calc_score(direction, rsi, ob, fvg, structure, candles, vol_h, near, divergence, htf_bias)
             tipo_setup    = clasificar_setup(direction, rsi, structure, divergence, htf_bias)
             if tipo_setup == "REBOTE": score = min(score, 5)
 
-            # 4. Vela contradictoria
+            # 6. Vela contradictoria
             if direction == "LONG"  and any("bajista" in p for p in candles): continue
             if direction == "SHORT" and any("alcista" in p for p in candles): continue
 
-            # 5. Divergencia contraria
+            # 7. Divergencia contraria
             if direction == "SHORT" and divergence == "BULLISH_DIV": continue
             if direction == "LONG"  and divergence == "BEARISH_DIV": continue
 
-            # 6. Estructura contraria
+            # 8. Estructura contraria
             if direction == "LONG"  and structure in ("BOS_BEAR", "CHoCH_BEAR"): continue
             if direction == "SHORT" and structure in ("BOS_BULL", "CHoCH_BULL"): continue
 
