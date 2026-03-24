@@ -24,17 +24,17 @@ TELEGRAM_TOKEN      = "8621482285:AAFXlOcgNwRQp1MMmYABaDLUXrXAoQgDplc"
 CHAT_ID             = "1343270628"
 BINANCE_BASE        = "https://api.binance.com/api/v3"
 
-MIN_SCORE           = 6     # Score mínimo para enviar alerta
+MIN_SCORE           = 3     # Score mínimo para enviar alerta
 RSI_OVERBOUGHT      = 70    # RSI sobrecomprado
 RSI_OVERSOLD        = 30    # RSI sobrevendido
 RSI_EXTREME         = 75    # RSI extremo — permite operar contra HTF
 ALERTA_COOLDOWN_MIN = 30    # Minutos entre alertas del mismo par/dirección
 
 SYMBOLS = [
-    "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "XRPUSDT",  "PEPEUSDT",
-    "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "DOTUSDT",   "RUNEUSDT",
-    "ROSEUSDT", "OPUSDT",  "ATOMUSDT", "NEARUSDT",  "HBARUSDT",
-    "THETAUSDT","FTMUSDT",  "SANDUSDT", "MANAUSDT",  "RENDERUSDT"
+    "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "XRPUSDT",  "BNBUSDT",
+    "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "DOTUSDT",   "PEPEUSDT",
+    "LINKUSDT", "LTCUSDT",  "ATOMUSDT", "NEARUSDT",  "HBARUSDT",
+    "THETAUSDT","FTMUSDT",  "SANDUSDT", "MANAUSDT",  "INJUSDT"
 ]
 
 INTERVALS = [
@@ -635,7 +635,94 @@ def detect_structure(df):
     return None
 
 
-def detect_hh_ll(df, lookback=50):
+def detect_fibonacci(df, lookback=100):
+    """
+    Detecta si el precio está en una zona de retroceso de Fibonacci.
+    Encuentra el último swing significativo (high → low o low → high)
+    y calcula los niveles de retroceso.
+
+    Niveles monitoreados:
+    - 0.382 → retroceso moderado
+    - 0.500 → equilibrio
+    - 0.618 → Golden Ratio — más importante
+    - 0.786 → retroceso profundo
+    - 0.886 → zona de reversión profunda (falso breakout antes de reversión)
+
+    Retorna: (nivel_fib, descripcion, direccion_esperada) o (None, None, None)
+    Tolerancia: precio dentro del 0.5% del nivel
+    """
+    try:
+        recent = df.iloc[-lookback:]
+        price  = recent["close"].iloc[-1]
+
+        # Encontrar swing high y swing low más recientes y significativos
+        swing_high_idx, swing_high_val = None, 0
+        swing_low_idx,  swing_low_val  = None, float("inf")
+
+        for i in range(3, len(recent) - 3):
+            h = recent["high"].iloc[i]
+            l = recent["low"].iloc[i]
+            if (h > recent["high"].iloc[i-1] and h > recent["high"].iloc[i+1] and
+                h > recent["high"].iloc[i-2] and h > recent["high"].iloc[i+2]):
+                if h > swing_high_val:
+                    swing_high_val = h
+                    swing_high_idx = i
+            if (l < recent["low"].iloc[i-1] and l < recent["low"].iloc[i+1] and
+                l < recent["low"].iloc[i-2] and l < recent["low"].iloc[i+2]):
+                if l < swing_low_val:
+                    swing_low_val = l
+                    swing_low_idx = i
+
+        if swing_high_idx is None or swing_low_idx is None: return None, None, None
+        if swing_high_val == swing_low_val: return None, None, None
+
+        rango = swing_high_val - swing_low_val
+
+        # Determinar si el último movimiento fue alcista o bajista
+        # para saber en qué dirección calcular el retroceso
+        if swing_high_idx > swing_low_idx:
+            # Movimiento alcista (low antes que high) → retroceso bajista
+            # Niveles desde el high hacia abajo
+            direccion = "LONG"  # retroceso alcista = buscar LONG en el retroceso
+            niveles = {
+                0.382: round(swing_high_val - rango * 0.382, 8),
+                0.500: round(swing_high_val - rango * 0.500, 8),
+                0.618: round(swing_high_val - rango * 0.618, 8),
+                0.786: round(swing_high_val - rango * 0.786, 8),
+                0.886: round(swing_high_val - rango * 0.886, 8),
+            }
+        else:
+            # Movimiento bajista (high antes que low) → retroceso alcista
+            # Niveles desde el low hacia arriba
+            direccion = "SHORT"  # retroceso bajista = buscar SHORT en el retroceso
+            niveles = {
+                0.382: round(swing_low_val + rango * 0.382, 8),
+                0.500: round(swing_low_val + rango * 0.500, 8),
+                0.618: round(swing_low_val + rango * 0.618, 8),
+                0.786: round(swing_low_val + rango * 0.786, 8),
+                0.886: round(swing_low_val + rango * 0.886, 8),
+            }
+
+        # Verificar si el precio está cerca de algún nivel (tolerancia 0.5%)
+        tolerancia = 0.005
+        for nivel, valor in sorted(niveles.items(), key=lambda x: abs(price - x[1])):
+            if abs(price - valor) / price <= tolerancia:
+                # Descripción especial para 0.886
+                if nivel == 0.886:
+                    desc = "Fib 0.886 — zona reversión profunda"
+                elif nivel == 0.618:
+                    desc = "Fib 0.618 — Golden Ratio"
+                elif nivel == 0.786:
+                    desc = "Fib 0.786 — retroceso profundo"
+                elif nivel == 0.500:
+                    desc = "Fib 0.500 — equilibrio"
+                else:
+                    desc = "Fib 0.382 — retroceso moderado"
+                return nivel, desc, direccion
+
+        return None, None, None
+    except:
+        return None, None, None
     """
     Detecta si el precio está cerca de un HH o LL reciente.
     HH (Higher High) = zona de oferta → ideal para SHORT.
@@ -869,6 +956,12 @@ def format_setup(s, tf_label):
     elif hh_ll_type == "LL" and hh_ll_level:
         lines.append("🔻 LL detectado: " + fmt(hh_ll_level) + " — zona de demanda")
 
+    fib_nivel = s.get("fib_nivel")
+    fib_desc  = s.get("fib_desc")
+    if fib_nivel and fib_desc:
+        fib_emoji = "🌀"
+        lines.append(fib_emoji + " " + fib_desc)
+
     lines.append("🕯 Vela:          " + (" | ".join(s["candles"]) if s["candles"] else "Sin patron"))
     lines += [
         "🟢 Soporte:       " + fmt(s["support"]),
@@ -929,6 +1022,7 @@ def analyze_symbol(symbol, interval):
         # Momentum de BTC — no shortear altcoins si BTC está subiendo y viceversa
         # No aplicar a BTCUSDT mismo
         btc_momentum            = get_btc_momentum(interval) if symbol != "BTCUSDT" else "NEUTRAL"
+        fib_nivel, fib_desc, fib_dir = detect_fibonacci(df)
         hh_ll_type, hh_ll_level = detect_hh_ll(df)
         near_sup                = abs(price - sup) / price < 0.01
         near_res                = abs(price - res) / price < 0.01
@@ -969,6 +1063,22 @@ def analyze_symbol(symbol, interval):
             score, labels = calc_score(direction, rsi, ob, fvg, structure, candles, vol_h, near, divergence, htf_bias)
             tipo_setup    = clasificar_setup(direction, rsi, structure, divergence, htf_bias)
             if tipo_setup == "REBOTE": score = min(score, 5)
+
+            # Fibonacci — sumar al score si el precio está en nivel relevante
+            # y la dirección del Fib coincide con la dirección del trade
+            if fib_nivel is not None and fib_dir == direction:
+                if fib_nivel == 0.886:
+                    score = min(score + 2.5, 10)   # Zona reversión profunda — mayor peso
+                    labels.append(fib_desc)
+                elif fib_nivel == 0.618:
+                    score = min(score + 2, 10)      # Golden Ratio
+                    labels.append(fib_desc)
+                elif fib_nivel == 0.786:
+                    score = min(score + 1.5, 10)    # Retroceso profundo
+                    labels.append(fib_desc)
+                elif fib_nivel in (0.382, 0.500):
+                    score = min(score + 1, 10)      # Niveles moderados
+                    labels.append(fib_desc)
 
             # 6. Vela contradictoria
             if direction == "LONG"  and any("bajista" in p for p in candles): continue
@@ -1051,7 +1161,9 @@ def analyze_symbol(symbol, interval):
                 "volatility":  vol,
                 "tipo_setup":  tipo_setup,
                 "hh_ll_type":  hh_ll_type,
-                "hh_ll_level": hh_ll_level
+                "hh_ll_level": hh_ll_level,
+                "fib_nivel":   fib_nivel,
+                "fib_desc":    fib_desc
             })
 
         return results if results else None
