@@ -24,7 +24,7 @@ TELEGRAM_TOKEN      = "8621482285:AAFXlOcgNwRQp1MMmYABaDLUXrXAoQgDplc"
 CHAT_ID             = "1343270628"
 BINANCE_BASE        = "https://api.binance.com/api/v3"
 
-MIN_SCORE           = 3     # Score mínimo para enviar alerta
+MIN_SCORE           = 5     # Score mínimo para enviar alerta
 RSI_OVERBOUGHT      = 70    # RSI sobrecomprado
 RSI_OVERSOLD        = 30    # RSI sobrevendido
 RSI_EXTREME         = 75    # RSI extremo — permite operar contra HTF (inverso: 100-75=25)
