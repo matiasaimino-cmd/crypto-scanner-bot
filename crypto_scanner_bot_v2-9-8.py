@@ -42,10 +42,10 @@ _retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 5
 _session.mount("https://", HTTPAdapter(max_retries=_retries))
 
 SYMBOLS = [
-    "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "XRPUSDT",  "BNBUSDT",
+    "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "XRPUSDT",  "RENDERUSDT",
     "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "DOTUSDT",   "PEPEUSDT",
-    "LINKUSDT", "LTCUSDT",  "ATOMUSDT", "NEARUSDT",  "HBARUSDT",
-    "THETAUSDT","FTMUSDT",  "SANDUSDT", "MANAUSDT",  "INJUSDT"
+    "LINKUSDT", "OPUSDT",  "ATOMUSDT", "NEARUSDT",  "HBARUSDT",
+    "THETAUSDT","FTMUSDT",  "SANDUSDT", "MANAUSDT",  "RUNEUSDT"
 ]
 
 INTERVALS = [
