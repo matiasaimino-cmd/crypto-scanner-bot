@@ -30,7 +30,7 @@ BINANCE_BASE        = "https://api.binance.com/api/v3"
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("❌ Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en variables de entorno")
 
-MIN_SCORE           = 6
+MIN_SCORE           = 3
 RSI_OVERBOUGHT      = 70
 RSI_OVERSOLD        = 30
 RSI_EXTREME         = 75
@@ -116,8 +116,16 @@ def init_db():
         # Crear constraint único para market_state si no existe
         try:
             cur.execute("""
-                ALTER TABLE market_state
-                ADD CONSTRAINT market_state_unique UNIQUE (symbol, timeframe)
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'market_state_unique'
+                    ) THEN
+                        ALTER TABLE market_state
+                        ADD CONSTRAINT market_state_unique UNIQUE (symbol, timeframe);
+                    END IF;
+                END$$;
             """)
             conn.commit()
         except:
