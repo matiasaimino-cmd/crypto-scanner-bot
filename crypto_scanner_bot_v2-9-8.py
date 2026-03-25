@@ -24,17 +24,17 @@ TELEGRAM_TOKEN      = "8621482285:AAFXlOcgNwRQp1MMmYABaDLUXrXAoQgDplc"
 CHAT_ID             = "1343270628"
 BINANCE_BASE        = "https://api.binance.com/api/v3"
 
-MIN_SCORE           = 5     # Score mínimo para enviar alerta
+MIN_SCORE           = 3     # Score mínimo para enviar alerta
 RSI_OVERBOUGHT      = 70    # RSI sobrecomprado
 RSI_OVERSOLD        = 30    # RSI sobrevendido
 RSI_EXTREME         = 75    # RSI extremo — permite operar contra HTF (inverso: 100-75=25)
 ALERTA_COOLDOWN_MIN = 30    # Minutos entre alertas del mismo par/dirección
 
 SYMBOLS = [
-    "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "XRPUSDT",  "COTIUSDT",
+    "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "XRPUSDT",  "BNBUSDT",
     "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "DOTUSDT",   "PEPEUSDT",
-    "ROSEUSDT", "RENDERUSDT",  "ATOMUSDT", "NEARUSDT",  "HBARUSDT",
-    "THETAUSDT","FTMUSDT",  "SANDUSDT", "MANAUSDT",  "OPUSDT"
+    "LINKUSDT", "LTCUSDT",  "ATOMUSDT", "NEARUSDT",  "HBARUSDT",
+    "THETAUSDT","FTMUSDT",  "SANDUSDT", "MANAUSDT",  "INJUSDT"
 ]
 
 INTERVALS = [
@@ -279,12 +279,16 @@ def procesar_comandos(last_update_id):
             print("Comando /scan recibido")
             send_telegram("🔄 Iniciando escaneo manual...")
             scan_all()
+        elif text == "/backtest":
+            print("Comando /backtest recibido")
+            run_backtest()
         elif text == "/ayuda":
             send_telegram(
                 "🤖 <b>Comandos disponibles:</b>\n\n"
-                "/resumen — últimas 20 alertas\n"
-                "/scan    — escaneo inmediato\n"
-                "/ayuda   — esta ayuda"
+                "/resumen   — últimas 20 alertas\n"
+                "/scan      — escaneo inmediato\n"
+                "/backtest  — backtesting del último mes\n"
+                "/ayuda     — esta ayuda"
             )
     return last_update_id
 
@@ -1181,7 +1185,238 @@ def scan_all():
 #   RESUMEN DIARIO
 # =============================================================================
 
-def resumen_diario():
+def run_backtest():
+    """
+    Backtesting de 1 mes sobre todos los pares y timeframes.
+    Simula las señales del bot sobre datos históricos de Binance
+    y calcula: win rate, profit/loss, mejor/peor operación, LONG vs SHORT.
+
+    Lógica de simulación:
+    - Por cada señal detectada, verifica si el precio alcanzó TP1, TP2, TP3 o SL
+    - Usa las siguientes 50 velas después de la señal para simular el resultado
+    - Resultado: WIN (llegó a TP1+), LOSS (tocó SL), NEUTRAL (no llegó a ninguno)
+    """
+    send_telegram("⏳ <b>Iniciando backtesting...</b>\nAnalizando 1 mes de datos para " + str(len(SYMBOLS)) + " pares x 2 TF. Puede tardar unos minutos.")
+    print("Iniciando backtesting...")
+
+    resultados = []
+    LOOKBACK_VELAS = {
+        "15m": 2880,   # 1 mes en velas de 15m = 30d * 24h * 4 = 2880
+        "1h":  720,    # 1 mes en velas de 1h  = 30d * 24h = 720
+    }
+    FUTURE_VELAS = 50  # Velas hacia adelante para verificar resultado
+
+    for interval, tf_label in INTERVALS:
+        limit = LOOKBACK_VELAS[interval] + 300  # +300 para indicadores
+        for symbol in SYMBOLS:
+            try:
+                df_full = get_klines(symbol, interval, limit=min(limit, 1000))
+                if df_full is None or len(df_full) < 300:
+                    print("Sin datos: " + symbol + " " + interval)
+                    continue
+
+                # Iterar sobre el período histórico dejando 50 velas al final para simular
+                step = 4 if interval == "15m" else 1  # saltar velas para no tardar demasiado
+                for i in range(250, len(df_full) - FUTURE_VELAS, step):
+                    df_slice = df_full.iloc[:i].copy().reset_index(drop=True)
+                    if len(df_slice) < 50: continue
+
+                    try:
+                        price        = df_slice["close"].iloc[-1]
+                        rsi          = calc_rsi(df_slice["close"])
+                        sup, res     = calc_sr(df_slice)
+                        ob_b, ob_s   = detect_ob(df_slice)
+                        fv_b, fv_s   = detect_fvg(df_slice)
+                        structure    = detect_structure(df_slice)
+                        candles      = detect_candle(df_slice)
+                        vol_r, vol_h = calc_vol(df_slice)
+                        divergence   = detect_rsi_divergence(df_slice)
+                        htf_bias     = get_htf_bias(symbol, interval)
+                        fib_nivel, fib_desc, fib_dir = detect_fibonacci(df_slice)
+                        hh_ll_type, hh_ll_level = detect_hh_ll(df_slice)
+                        near_sup     = abs(price - sup) / price < 0.01
+                        near_res     = abs(price - res) / price < 0.01
+                        btc_momentum = "NEUTRAL"  # Simplificado para backtest
+                        bias_1h      = None       # Simplificado para backtest
+
+                        for direction, ob, fvg, near in [("LONG", ob_b, fv_b, near_sup), ("SHORT", ob_s, fv_s, near_res)]:
+                            # Aplicar los mismos filtros del bot
+                            if direction == "SHORT" and rsi < 50 and rsi < RSI_EXTREME: continue
+                            if direction == "LONG"  and rsi > 50 and rsi > (100-RSI_EXTREME): continue
+                            rsi_extremo = (direction == "SHORT" and rsi >= RSI_EXTREME) or \
+                                          (direction == "LONG"  and rsi <= (100-RSI_EXTREME))
+                            if direction == "SHORT" and htf_bias == "BULLISH" and not rsi_extremo: continue
+                            if direction == "LONG"  and htf_bias == "BEARISH" and not rsi_extremo: continue
+
+                            score, labels = calc_score(direction, rsi, ob, fvg, structure, candles, vol_h, near, divergence, htf_bias)
+                            tipo_setup    = clasificar_setup(direction, rsi, structure, divergence, htf_bias)
+                            if tipo_setup == "REBOTE": score = min(score, 5)
+
+                            fib_valido = fib_nivel is not None and fib_dir == direction
+                            if fib_valido:
+                                if fib_nivel == 0.886:   score = min(score + 2.5, 10)
+                                elif fib_nivel == 0.618: score = min(score + 2.0, 10)
+                                elif fib_nivel == 0.786: score = min(score + 1.5, 10)
+                                else:                    score = min(score + 1.0, 10)
+
+                            if direction == "LONG"  and any("bajista" in p for p in candles): continue
+                            if direction == "SHORT" and any("alcista" in p for p in candles): continue
+                            if direction == "SHORT" and divergence == "BULLISH_DIV": continue
+                            if direction == "LONG"  and divergence == "BEARISH_DIV": continue
+                            if direction == "LONG"  and structure in ("BOS_BEAR", "CHoCH_BEAR"): continue
+                            if direction == "SHORT" and structure in ("BOS_BULL", "CHoCH_BULL"): continue
+                            if ob:
+                                if direction == "SHORT" and (ob["low"] - price) / price > 0.005: continue
+                                if direction == "LONG"  and (price - ob["high"]) / price > 0.005: continue
+                            hh_ll_valido = (direction == "SHORT" and hh_ll_type == "HH") or \
+                                           (direction == "LONG"  and hh_ll_type == "LL")
+                            if not ob and not fvg and not hh_ll_valido: continue
+                            if hh_ll_valido: score = min(score + 2, 10)
+                            if direction == "SHORT" and near_sup: continue
+                            if direction == "LONG"  and near_res: continue
+                            if vol_r < 20: continue
+                            if score < MIN_SCORE: continue
+
+                            # Calcular SL y TPs
+                            sl, tp1, tp2, tp3, rr1, rr2 = calc_sl_tp(price, direction, sup, res)
+                            if tipo_setup == "REBOTE":
+                                risk = price * 0.01
+                                if direction == "LONG":
+                                    sl = round(price - risk, 6); tp1 = round(price + risk * 0.8, 6)
+                                    tp2 = round(price + risk * 1.5, 6); tp3 = round(price + risk * 2.0, 6)
+                                else:
+                                    sl = round(price + risk, 6); tp1 = round(price - risk * 0.8, 6)
+                                    tp2 = round(price - risk * 1.5, 6); tp3 = round(price - risk * 2.0, 6)
+
+                            # Simular resultado con las siguientes 50 velas
+                            future = df_full.iloc[i:i+FUTURE_VELAS]
+                            resultado = "NEUTRAL"
+                            tp_alcanzado = 0
+                            pnl_pct = 0.0
+
+                            for _, vela in future.iterrows():
+                                h, l = vela["high"], vela["low"]
+                                if direction == "LONG":
+                                    if l <= sl:
+                                        resultado = "LOSS"
+                                        pnl_pct = round((sl - price) / price * 100, 2)
+                                        break
+                                    elif h >= tp3:
+                                        resultado = "WIN"; tp_alcanzado = 3
+                                        pnl_pct = round((tp3 - price) / price * 100, 2); break
+                                    elif h >= tp2:
+                                        resultado = "WIN"; tp_alcanzado = 2
+                                        pnl_pct = round((tp2 - price) / price * 100, 2)
+                                    elif h >= tp1 and tp_alcanzado == 0:
+                                        resultado = "WIN"; tp_alcanzado = 1
+                                        pnl_pct = round((tp1 - price) / price * 100, 2)
+                                else:
+                                    if h >= sl:
+                                        resultado = "LOSS"
+                                        pnl_pct = round((price - sl) / price * 100, 2)
+                                        break
+                                    elif l <= tp3:
+                                        resultado = "WIN"; tp_alcanzado = 3
+                                        pnl_pct = round((price - tp3) / price * 100, 2); break
+                                    elif l <= tp2:
+                                        resultado = "WIN"; tp_alcanzado = 2
+                                        pnl_pct = round((price - tp2) / price * 100, 2)
+                                    elif l <= tp1 and tp_alcanzado == 0:
+                                        resultado = "WIN"; tp_alcanzado = 1
+                                        pnl_pct = round((price - tp1) / price * 100, 2)
+
+                            if resultado != "NEUTRAL":
+                                resultados.append({
+                                    "symbol":    symbol,
+                                    "direction": direction,
+                                    "timeframe": tf_label,
+                                    "score":     score,
+                                    "tipo":      tipo_setup,
+                                    "resultado": resultado,
+                                    "tp":        tp_alcanzado,
+                                    "pnl_pct":   pnl_pct if resultado == "WIN" else -abs(pnl_pct),
+                                    "precio":    price,
+                                })
+                    except:
+                        continue
+                time.sleep(0.1)
+                print("BT " + symbol + " " + interval + " — señales: " + str(len([r for r in resultados if r["symbol"] == symbol])))
+            except Exception as e:
+                print("Error BT " + symbol + ": " + str(e))
+
+    # ── Calcular métricas ────────────────────────────────────────────────────
+    if not resultados:
+        send_telegram("❌ Backtesting sin resultados — no se encontraron señales en el período.")
+        return
+
+    total    = len(resultados)
+    wins     = [r for r in resultados if r["resultado"] == "WIN"]
+    losses   = [r for r in resultados if r["resultado"] == "LOSS"]
+    win_rate = round(len(wins) / total * 100, 1)
+    pnl_avg  = round(sum(r["pnl_pct"] for r in resultados) / total, 2)
+    pnl_wins = round(sum(r["pnl_pct"] for r in wins) / len(wins), 2) if wins else 0
+    pnl_loss = round(sum(r["pnl_pct"] for r in losses) / len(losses), 2) if losses else 0
+
+    mejor = max(resultados, key=lambda x: x["pnl_pct"])
+    peor  = min(resultados, key=lambda x: x["pnl_pct"])
+
+    longs  = [r for r in resultados if r["direction"] == "LONG"]
+    shorts = [r for r in resultados if r["direction"] == "SHORT"]
+    wr_long  = round(len([r for r in longs  if r["resultado"] == "WIN"]) / len(longs)  * 100, 1) if longs  else 0
+    wr_short = round(len([r for r in shorts if r["resultado"] == "WIN"]) / len(shorts) * 100, 1) if shorts else 0
+
+    # TPs alcanzados
+    tp1_count = len([r for r in wins if r["tp"] >= 1])
+    tp2_count = len([r for r in wins if r["tp"] >= 2])
+    tp3_count = len([r for r in wins if r["tp"] == 3])
+
+    # Por tipo de setup
+    rev  = [r for r in resultados if r["tipo"] == "REVERSION"]
+    reb  = [r for r in resultados if r["tipo"] == "REBOTE"]
+    stp  = [r for r in resultados if r["tipo"] == "SETUP"]
+    wr_rev = round(len([r for r in rev if r["resultado"] == "WIN"]) / len(rev)  * 100, 1) if rev  else 0
+    wr_reb = round(len([r for r in reb if r["resultado"] == "WIN"]) / len(reb)  * 100, 1) if reb  else 0
+    wr_stp = round(len([r for r in stp if r["resultado"] == "WIN"]) / len(stp)  * 100, 1) if stp  else 0
+
+    # ── Armar mensaje ────────────────────────────────────────────────────────
+    msg  = "📊 <b>BACKTESTING — 1 MES</b>\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "📋 Total señales analizadas: <b>" + str(total) + "</b>\n"
+    msg += "✅ Ganadoras: <b>" + str(len(wins)) + "</b>  ❌ Perdedoras: <b>" + str(len(losses)) + "</b>\n\n"
+
+    msg += "🏆 <b>WIN RATE GENERAL</b>\n"
+    msg += "Win Rate: <b>" + str(win_rate) + "%</b>\n"
+    msg += "P&L promedio: <b>" + str(pnl_avg) + "%</b>\n"
+    msg += "Ganancia prom WIN: <b>+" + str(pnl_wins) + "%</b>\n"
+    msg += "Pérdida prom LOSS: <b>" + str(pnl_loss) + "%</b>\n\n"
+
+    msg += "🎯 <b>TPs ALCANZADOS</b>\n"
+    msg += "TP1: " + str(tp1_count) + " veces  TP2: " + str(tp2_count) + "  TP3: " + str(tp3_count) + "\n\n"
+
+    msg += "📈 <b>LONG vs SHORT</b>\n"
+    msg += "LONG:  " + str(len(longs))  + " señales — Win rate: <b>" + str(wr_long)  + "%</b>\n"
+    msg += "SHORT: " + str(len(shorts)) + " señales — Win rate: <b>" + str(wr_short) + "%</b>\n\n"
+
+    msg += "🔄 <b>POR TIPO DE SETUP</b>\n"
+    msg += "REVERSIÓN: " + str(len(rev)) + " señales — Win rate: <b>" + str(wr_rev) + "%</b>\n"
+    msg += "REBOTE:    " + str(len(reb)) + " señales — Win rate: <b>" + str(wr_reb) + "%</b>\n"
+    msg += "SETUP:     " + str(len(stp)) + " señales — Win rate: <b>" + str(wr_stp) + "%</b>\n\n"
+
+    msg += "🥇 <b>MEJOR OPERACIÓN</b>\n"
+    msg += mejor["direction"] + " " + mejor["symbol"] + " [" + mejor["timeframe"] + "]\n"
+    msg += "Score: " + str(mejor["score"]) + " | TP" + str(mejor["tp"]) + " | +" + str(mejor["pnl_pct"]) + "%\n\n"
+
+    msg += "💀 <b>PEOR OPERACIÓN</b>\n"
+    msg += peor["direction"] + " " + peor["symbol"] + " [" + peor["timeframe"] + "]\n"
+    msg += "Score: " + str(peor["score"]) + " | " + str(peor["pnl_pct"]) + "%\n\n"
+
+    msg += "━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "🕐 " + datetime.now(ARG_TZ).strftime("%d/%m %H:%M")
+
+    send_telegram(msg)
+    print("Backtesting completado — " + str(total) + " señales")
+
+
     """Envía resumen de las últimas 20 alertas — automático a las 8am o con /resumen"""
     historial = get_historial_alertas(20)
     if not historial: return
@@ -1213,7 +1448,7 @@ if __name__ == "__main__":
         "⚙️ Score mínimo: " + str(MIN_SCORE) + "/10\n"
         "⏱ Cooldown: " + str(ALERTA_COOLDOWN_MIN) + " minutos\n"
         "🔄 Escaneo cada 5 minutos\n\n"
-        "💬 Comandos: /resumen | /scan | /ayuda"
+        "💬 Comandos: /resumen | /scan | /backtest | /ayuda"
     )
     scan_all()
     schedule.every(5).minutes.do(scan_all)
