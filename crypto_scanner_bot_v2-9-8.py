@@ -30,7 +30,7 @@ BINANCE_BASE        = "https://api.binance.com/api/v3"
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("❌ Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en variables de entorno")
 
-MIN_SCORE           = 6
+MIN_SCORE           = 3
 RSI_OVERBOUGHT      = 70
 RSI_OVERSOLD        = 30
 RSI_EXTREME         = 75
@@ -113,8 +113,19 @@ def init_db():
             )
         """)
         conn.commit()
-        # Crear constraint único para market_state si no existe
+        # Limpiar duplicados en market_state y crear constraint único
         try:
+            # Primero eliminar filas duplicadas dejando solo la más reciente
+            cur.execute("""
+                DELETE FROM market_state
+                WHERE id NOT IN (
+                    SELECT MAX(id)
+                    FROM market_state
+                    GROUP BY symbol, timeframe
+                )
+            """)
+            conn.commit()
+            # Ahora crear el constraint único
             cur.execute("""
                 DO $$
                 BEGIN
@@ -128,7 +139,9 @@ def init_db():
                 END$$;
             """)
             conn.commit()
-        except:
+            print("Constraint market_state_unique OK")
+        except Exception as e:
+            print("Error constraint: " + str(e))
             conn.rollback()
         # Ampliar columnas VARCHAR por si las tablas ya existían con tamaño menor
         try:
@@ -1450,7 +1463,11 @@ def run_backtest():
     send_telegram(msg)
     print("Backtesting completado — " + str(total) + " señales")
 
+# =============================================================================
+#   RESUMEN DIARIO
+# =============================================================================
 
+def resumen_diario():
     """Envía resumen de las últimas 20 alertas — automático a las 8am o con /resumen"""
     historial = get_historial_alertas(20)
     if not historial: return
