@@ -12,23 +12,34 @@ import time
 import schedule
 import psycopg2
 import os
+import html as html_lib
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # =============================================================================
 #   CONFIGURACIÓN GENERAL
 # =============================================================================
 
 ARG_TZ              = ZoneInfo("America/Argentina/Buenos_Aires")
-TELEGRAM_TOKEN      = "8621482285:AAFXlOcgNwRQp1MMmYABaDLUXrXAoQgDplc"
-CHAT_ID             = "1343270628"
+TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID             = os.environ.get("TELEGRAM_CHAT_ID", "")
 BINANCE_BASE        = "https://api.binance.com/api/v3"
 
-MIN_SCORE           = 6     # Score mínimo para enviar alerta
-RSI_OVERBOUGHT      = 70    # RSI sobrecomprado
-RSI_OVERSOLD        = 30    # RSI sobrevendido
-RSI_EXTREME         = 75    # RSI extremo — permite operar contra HTF (inverso: 100-75=25)
-ALERTA_COOLDOWN_MIN = 30    # Minutos entre alertas del mismo par/dirección
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    raise SystemExit("❌ Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en variables de entorno")
+
+MIN_SCORE           = 3
+RSI_OVERBOUGHT      = 70
+RSI_OVERSOLD        = 30
+RSI_EXTREME         = 75
+ALERTA_COOLDOWN_MIN = 30
+
+# Session HTTP con reintentos automáticos — evita colapso por errores 429/5xx
+_session = requests.Session()
+_retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+_session.mount("https://", HTTPAdapter(max_retries=_retries))
 
 SYMBOLS = [
     "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "XRPUSDT",  "BNBUSDT",
@@ -102,6 +113,15 @@ def init_db():
             )
         """)
         conn.commit()
+        # Crear constraint único para market_state si no existe
+        try:
+            cur.execute("""
+                ALTER TABLE market_state
+                ADD CONSTRAINT market_state_unique UNIQUE (symbol, timeframe)
+            """)
+            conn.commit()
+        except:
+            conn.rollback()
         # Ampliar columnas VARCHAR por si las tablas ya existían con tamaño menor
         try:
             cur.execute("ALTER TABLE alertas      ALTER COLUMN timeframe TYPE VARCHAR(20)")
@@ -165,7 +185,7 @@ def guardar_alerta(s, tf_label):
 
 
 def guardar_estado(symbol, timeframe, rsi, estructura, htf_bias, divergencia, precio):
-    """Guarda el estado actual del mercado para tracking"""
+    """Guarda el estado actual del mercado — actualiza si ya existe"""
     conn = get_db()
     if not conn: return
     try:
@@ -174,7 +194,13 @@ def guardar_estado(symbol, timeframe, rsi, estructura, htf_bias, divergencia, pr
             INSERT INTO market_state
                 (symbol, timeframe, rsi, estructura, htf_bias, divergencia, precio)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (symbol, timeframe) DO UPDATE
+            SET rsi          = EXCLUDED.rsi,
+                estructura   = EXCLUDED.estructura,
+                htf_bias     = EXCLUDED.htf_bias,
+                divergencia  = EXCLUDED.divergencia,
+                precio       = EXCLUDED.precio,
+                actualizado_at = NOW()
         """, (symbol, timeframe, float(rsi), str(estructura), str(htf_bias), str(divergencia), float(precio)))
         conn.commit()
     except Exception as e:
@@ -232,11 +258,11 @@ def get_historial_alertas(limite=20):
 # =============================================================================
 
 def send_telegram(message):
-    """Envía mensaje a Telegram en chunks de 4000 caracteres"""
+    """Envía mensaje a Telegram en chunks de 4000 caracteres con reintentos"""
     url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
     for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
         try:
-            requests.post(
+            _session.post(
                 url,
                 json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
                 timeout=10
@@ -252,7 +278,7 @@ def get_telegram_updates(offset=None):
         url    = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/getUpdates"
         params = {"timeout": 5}
         if offset: params["offset"] = offset
-        r = requests.get(url, params=params, timeout=10)
+        r = _session.get(url, params=params, timeout=10)
         return r.json().get("result", [])
     except:
         return []
@@ -297,9 +323,9 @@ def procesar_comandos(last_update_id):
 # =============================================================================
 
 def get_klines(symbol, interval, limit=200):
-    """Obtiene velas de Binance y retorna DataFrame"""
+    """Obtiene velas de Binance usando session con reintentos automáticos"""
     try:
-        r = requests.get(
+        r = _session.get(
             BINANCE_BASE + "/klines",
             params={"symbol": symbol, "interval": interval, "limit": limit},
             timeout=10
