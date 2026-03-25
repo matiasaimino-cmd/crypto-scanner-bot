@@ -42,10 +42,10 @@ _retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 5
 _session.mount("https://", HTTPAdapter(max_retries=_retries))
 
 SYMBOLS = [
-    "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "XRPUSDT",  "RENDERUSDT",
-    "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "DOTUSDT",   "PEPEUSDT",
-    "LINKUSDT", "OPUSDT",  "ATOMUSDT", "NEARUSDT",  "HBARUSDT",
-    "THETAUSDT","FTMUSDT",  "SANDUSDT", "MANAUSDT",  "RUNEUSDT"
+    "BTCUSDT",  "ETHUSDT",  "SOLUSDT",   "XRPUSDT",  "DOGEUSDT",
+    "ADAUSDT",  "AVAXUSDT", "DOTUSDT",   "PEPEUSDT",  "LTCUSDT",
+    "ATOMUSDT", "NEARUSDT", "HBARUSDT",  "THETAUSDT", "FTMUSDT",
+    "SANDUSDT", "MANAUSDT", "RUNEUSDT",  "OPUSDT",    "RENDERUSDT"
 ]
 
 INTERVALS = [
@@ -1279,21 +1279,28 @@ def run_backtest():
                         vol_r, vol_h = calc_vol(df_slice)
                         divergence   = detect_rsi_divergence(df_slice)
                         htf_bias     = get_htf_bias(symbol, interval)
+                        bias_1h      = get_1h_bias(symbol) if interval == "15m" else None
+                        btc_momentum = get_btc_momentum(interval) if symbol != "BTCUSDT" else "NEUTRAL"
                         fib_nivel, fib_desc, fib_dir = detect_fibonacci(df_slice)
                         hh_ll_type, hh_ll_level = detect_hh_ll(df_slice)
                         near_sup     = abs(price - sup) / price < 0.01
                         near_res     = abs(price - res) / price < 0.01
-                        btc_momentum = "NEUTRAL"  # Simplificado para backtest
-                        bias_1h      = None       # Simplificado para backtest
 
                         for direction, ob, fvg, near in [("LONG", ob_b, fv_b, near_sup), ("SHORT", ob_s, fv_s, near_res)]:
-                            # Aplicar los mismos filtros del bot
                             if direction == "SHORT" and rsi < 50 and rsi < RSI_EXTREME: continue
                             if direction == "LONG"  and rsi > 50 and rsi > (100-RSI_EXTREME): continue
                             rsi_extremo = (direction == "SHORT" and rsi >= RSI_EXTREME) or \
                                           (direction == "LONG"  and rsi <= (100-RSI_EXTREME))
                             if direction == "SHORT" and htf_bias == "BULLISH" and not rsi_extremo: continue
                             if direction == "LONG"  and htf_bias == "BEARISH" and not rsi_extremo: continue
+                            # Filtro 1H para trades de 15m
+                            if bias_1h is not None and not rsi_extremo:
+                                if direction == "SHORT" and bias_1h == "BULLISH": continue
+                                if direction == "LONG"  and bias_1h == "BEARISH": continue
+                            # Filtro correlación BTC
+                            if not rsi_extremo:
+                                if direction == "SHORT" and btc_momentum == "BULLISH": continue
+                                if direction == "LONG"  and btc_momentum == "BEARISH": continue
 
                             score, labels = calc_score(direction, rsi, ob, fvg, structure, candles, vol_h, near, divergence, htf_bias)
                             tipo_setup    = clasificar_setup(direction, rsi, structure, divergence, htf_bias)
