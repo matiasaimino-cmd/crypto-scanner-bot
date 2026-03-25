@@ -30,7 +30,7 @@ BINANCE_BASE        = "https://api.binance.com/api/v3"
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("❌ Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en variables de entorno")
 
-MIN_SCORE           = 3
+MIN_SCORE           = 6
 RSI_OVERBOUGHT      = 70
 RSI_OVERSOLD        = 30
 RSI_EXTREME         = 75
