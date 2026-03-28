@@ -1,5 +1,6 @@
-requests
+yfinance
 pandas
 numpy
-schedule
 psycopg2-binary
+requests
+schedule
