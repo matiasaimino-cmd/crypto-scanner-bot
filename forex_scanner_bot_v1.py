@@ -352,12 +352,35 @@ def fmt_fx(p):
 
 def en_sesion_activa():
     """
-    Verifica si estamos en horario de sesión activa.
-    Londres: 06:00-15:00 ART | Nueva York: 11:00-20:00 ART
-    Solapamiento Londres-NY (11-15 ART) es el mejor momento.
+    Verifica si el mercado Forex/Commodities está abierto.
+
+    Horarios (hora Argentina ART = UTC-3):
+    - Lunes a Viernes: 06:00 - 17:00 ART (Londres + Nueva York)
+    - Domingo: desde las 19:00 ART (apertura Sydney/Tokio)
+    - Sábado: CERRADO todo el día
+    - Viernes: hasta las 17:00 ART (cierre NY)
+
+    Mercado abre: Domingo 19:00 ART
+    Mercado cierra: Viernes 17:00 ART
     """
-    hora = datetime.now(ARG_TZ).hour
-    return SESION_INICIO <= hora < SESION_FIN
+    now      = datetime.now(ARG_TZ)
+    hora     = now.hour
+    dia      = now.weekday()  # 0=Lunes, 1=Martes ... 5=Sábado, 6=Domingo
+
+    # Sábado — mercado CERRADO todo el día
+    if dia == 5:
+        return False
+
+    # Domingo — solo desde las 19:00 ART
+    if dia == 6:
+        return hora >= 19
+
+    # Viernes — solo hasta las 17:00 ART
+    if dia == 4:
+        return hora < 17
+
+    # Lunes a Jueves — parate de 17:00 a 19:00 ART (cierre NY / apertura Sydney)
+    return not (17 <= hora < 19)
 
 # =============================================================================
 #   INDICADORES TÉCNICOS (misma lógica que el bot crypto)
@@ -988,7 +1011,11 @@ if __name__ == "__main__":
         "📊 Pares:\n"
         "— Forex: EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CHF, NZD/USD, USD/CAD, EUR/GBP\n"
         "— Commodities: Oro, Plata, Petróleo WTI, Brent\n\n"
-        "⏰ Opera solo en sesión activa (06:00-20:00 ART)\n"
+        "⏰ Horario de operación:\n"
+        "— Lun-Jue: 06:00–20:00 ART\n"
+        "— Viernes: 06:00–17:00 ART\n"
+        "— Sábado: CERRADO\n"
+        "— Domingo: desde 19:00 ART\n\n"
         "🔄 Escaneo cada 15 minutos\n"
         "⚙️ Score mínimo: " + str(MIN_SCORE) + "/10\n\n"
         "💬 Comandos: /fxresumen | /fxscan | /fxayuda"
