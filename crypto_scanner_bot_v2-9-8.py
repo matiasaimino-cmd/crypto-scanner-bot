@@ -904,19 +904,72 @@ def calc_score(direction, rsi, ob, fvg, structure, patterns, vol_high, near_sr, 
     return round(min(max(score, 0), 10)), labels
 
 
-def calc_sl_tp(price, direction, support, resistance):
+def calc_sl_tp(price, direction, support, resistance, df=None):
     """
-    SL: soporte/resistencia con buffer del 0.3%.
-    TPs: ratios 1:1.5, 1:2.5, 1:4.0.
+    SL basado en el swing high/low más reciente — más inteligente que S/R estático.
+
+    Para SHORT: SL por encima del último swing high + 0.2% buffer
+    Para LONG:  SL por debajo del último swing low  - 0.2% buffer
+
+    Si el swing está muy lejos (>3%) usa el S/R estático como fallback.
+    TPs: ratios 1:1.5, 1:2.5, 1:4.0
     """
+    sl = None
+
+    # Intentar usar swing high/low del DataFrame
+    if df is not None:
+        try:
+            if direction == "SHORT":
+                # Buscar el swing high más reciente en las últimas 30 velas
+                recent = df.iloc[-30:]
+                swing_highs = []
+                for i in range(2, len(recent)-2):
+                    if (recent["high"].iloc[i] > recent["high"].iloc[i-1] and
+                        recent["high"].iloc[i] > recent["high"].iloc[i+1] and
+                        recent["high"].iloc[i] > recent["high"].iloc[i-2] and
+                        recent["high"].iloc[i] > recent["high"].iloc[i+2]):
+                        swing_highs.append(recent["high"].iloc[i])
+                if swing_highs:
+                    swing_h = max(swing_highs[-3:])  # el más alto de los últimos 3 swings
+                    sl_candidato = round(swing_h * 1.002, 6)  # buffer 0.2%
+                    # Validar que no sea más del 3% del precio
+                    if (sl_candidato - price) / price <= 0.03:
+                        sl = sl_candidato
+
+            else:  # LONG
+                # Buscar el swing low más reciente en las últimas 30 velas
+                recent = df.iloc[-30:]
+                swing_lows = []
+                for i in range(2, len(recent)-2):
+                    if (recent["low"].iloc[i] < recent["low"].iloc[i-1] and
+                        recent["low"].iloc[i] < recent["low"].iloc[i+1] and
+                        recent["low"].iloc[i] < recent["low"].iloc[i-2] and
+                        recent["low"].iloc[i] < recent["low"].iloc[i+2]):
+                        swing_lows.append(recent["low"].iloc[i])
+                if swing_lows:
+                    swing_l = min(swing_lows[-3:])  # el más bajo de los últimos 3 swings
+                    sl_candidato = round(swing_l * 0.998, 6)  # buffer 0.2%
+                    # Validar que no sea más del 3% del precio
+                    if (price - sl_candidato) / price <= 0.03:
+                        sl = sl_candidato
+        except:
+            sl = None
+
+    # Fallback al S/R estático si no se encontró swing válido
+    if sl is None:
+        if direction == "LONG":
+            sl = round(support * 0.997, 6)
+        else:
+            sl = round(resistance * 1.003, 6)
+
+    # Calcular riesgo y TPs
     if direction == "LONG":
-        sl            = round(support * 0.997, 6)
-        risk          = max(price - sl, price * 0.005)
+        risk = max(price - sl, price * 0.005)
         tp1, tp2, tp3 = round(price+risk*1.5, 6), round(price+risk*2.5, 6), round(price+risk*4.0, 6)
     else:
-        sl            = round(resistance * 1.003, 6)
-        risk          = max(sl - price, price * 0.005)
+        risk = max(sl - price, price * 0.005)
         tp1, tp2, tp3 = round(price-risk*1.5, 6), round(price-risk*2.5, 6), round(price-risk*4.0, 6)
+
     return sl, tp1, tp2, tp3, round(abs(tp1-price)/risk, 1), round(abs(tp2-price)/risk, 1)
 
 # =============================================================================
@@ -1122,7 +1175,7 @@ def analyze_symbol(symbol, interval):
             if ya_alerte(symbol, direction, interval): continue
 
             # ── SL / TPs ─────────────────────────────────────────────────────
-            sl, tp1, tp2, tp3, rr1, rr2 = calc_sl_tp(price, direction, sup, res)
+            sl, tp1, tp2, tp3, rr1, rr2 = calc_sl_tp(price, direction, sup, res, df)
 
             # Para REBOTE: SL ajustado al 1% y TPs más cortos
             if tipo_setup == "REBOTE":
@@ -1332,7 +1385,7 @@ def run_backtest():
                             if score < MIN_SCORE: continue
 
                             # Calcular SL y TPs
-                            sl, tp1, tp2, tp3, rr1, rr2 = calc_sl_tp(price, direction, sup, res)
+                            sl, tp1, tp2, tp3, rr1, rr2 = calc_sl_tp(price, direction, sup, res, df_slice)
                             if tipo_setup == "REBOTE":
                                 risk = price * 0.01
                                 if direction == "LONG":

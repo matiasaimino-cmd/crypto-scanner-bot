@@ -733,19 +733,61 @@ def calc_score(direction, rsi, ob, fvg, structure, patterns, vol_high, near_sr, 
     return round(min(max(score, 0), 10)), labels
 
 
-def calc_sl_tp_fx(price, direction, support, resistance):
+def calc_sl_tp_fx(price, direction, support, resistance, df=None):
     """
-    SL/TP para Forex — buffer más ajustado que crypto (0.1% en vez de 0.3%)
-    TPs con R:R 1:1.5, 1:2.5 y 1:4
+    SL basado en swing high/low más reciente — más inteligente que S/R estático.
+    Buffer 0.1% para Forex (más ajustado que crypto por menor volatilidad).
+    TPs: R:R 1:1.5, 1:2.5, 1:4.0
     """
+    sl = None
+
+    if df is not None:
+        try:
+            if direction == "SHORT":
+                recent = df.iloc[-30:]
+                swing_highs = []
+                for i in range(2, len(recent)-2):
+                    if (recent["high"].iloc[i] > recent["high"].iloc[i-1] and
+                        recent["high"].iloc[i] > recent["high"].iloc[i+1] and
+                        recent["high"].iloc[i] > recent["high"].iloc[i-2] and
+                        recent["high"].iloc[i] > recent["high"].iloc[i+2]):
+                        swing_highs.append(recent["high"].iloc[i])
+                if swing_highs:
+                    swing_h = max(swing_highs[-3:])
+                    sl_candidato = round(swing_h * 1.001, 6)  # buffer 0.1%
+                    if (sl_candidato - price) / price <= 0.02:  # máx 2% para Forex
+                        sl = sl_candidato
+            else:
+                recent = df.iloc[-30:]
+                swing_lows = []
+                for i in range(2, len(recent)-2):
+                    if (recent["low"].iloc[i] < recent["low"].iloc[i-1] and
+                        recent["low"].iloc[i] < recent["low"].iloc[i+1] and
+                        recent["low"].iloc[i] < recent["low"].iloc[i-2] and
+                        recent["low"].iloc[i] < recent["low"].iloc[i+2]):
+                        swing_lows.append(recent["low"].iloc[i])
+                if swing_lows:
+                    swing_l = min(swing_lows[-3:])
+                    sl_candidato = round(swing_l * 0.999, 6)  # buffer 0.1%
+                    if (price - sl_candidato) / price <= 0.02:
+                        sl = sl_candidato
+        except:
+            sl = None
+
+    # Fallback al S/R estático
+    if sl is None:
+        if direction == "LONG":
+            sl = round(support * 0.999, 6)
+        else:
+            sl = round(resistance * 1.001, 6)
+
     if direction == "LONG":
-        sl            = round(support * 0.999, 6)
-        risk          = max(price - sl, price * 0.002)
+        risk = max(price - sl, price * 0.002)
         tp1, tp2, tp3 = round(price+risk*1.5, 6), round(price+risk*2.5, 6), round(price+risk*4.0, 6)
     else:
-        sl            = round(resistance * 1.001, 6)
-        risk          = max(sl - price, price * 0.002)
+        risk = max(sl - price, price * 0.002)
         tp1, tp2, tp3 = round(price-risk*1.5, 6), round(price-risk*2.5, 6), round(price-risk*4.0, 6)
+
     return sl, tp1, tp2, tp3, round(abs(tp1-price)/risk, 1), round(abs(tp2-price)/risk, 1)
 
 # =============================================================================
@@ -914,7 +956,7 @@ def analyze_symbol_fx(symbol, symbol_yf, interval, tf_label):
             if ya_alerte_fx(symbol, direction, tf_label): continue
 
             # SL/TP
-            sl, tp1, tp2, tp3, rr1, rr2 = calc_sl_tp_fx(price, direction, sup, res)
+            sl, tp1, tp2, tp3, rr1, rr2 = calc_sl_tp_fx(price, direction, sup, res, df)
 
             results.append({
                 "symbol":      symbol,
