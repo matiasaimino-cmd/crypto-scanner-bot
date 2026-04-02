@@ -352,35 +352,59 @@ def fmt_fx(p):
 
 def en_sesion_activa():
     """
-    Verifica si el mercado Forex/Commodities está abierto.
-
-    Horarios (hora Argentina ART = UTC-3):
-    - Lunes a Viernes: 06:00 - 17:00 ART (Londres + Nueva York)
-    - Domingo: desde las 19:00 ART (apertura Sydney/Tokio)
-    - Sábado: CERRADO todo el día
-    - Viernes: hasta las 17:00 ART (cierre NY)
-
-    Mercado abre: Domingo 19:00 ART
-    Mercado cierra: Viernes 17:00 ART
+    Verifica si el mercado Forex/Commodities está abierto globalmente.
+    Sábado cerrado, domingo desde 19:00, viernes hasta 17:00, parate 17-19 L-J.
     """
-    now      = datetime.now(ARG_TZ)
-    hora     = now.hour
-    dia      = now.weekday()  # 0=Lunes, 1=Martes ... 5=Sábado, 6=Domingo
+    now  = datetime.now(ARG_TZ)
+    hora = now.hour
+    dia  = now.weekday()  # 0=Lunes ... 5=Sábado, 6=Domingo
 
-    # Sábado — mercado CERRADO todo el día
-    if dia == 5:
-        return False
+    if dia == 5: return False           # Sábado cerrado
+    if dia == 6: return hora >= 19      # Domingo desde 19:00
+    if dia == 4: return hora < 17       # Viernes hasta 17:00
+    return not (17 <= hora < 19)        # L-J: parate 17-19
 
-    # Domingo — solo desde las 19:00 ART
-    if dia == 6:
-        return hora >= 19
 
-    # Viernes — solo hasta las 17:00 ART
-    if dia == 4:
-        return hora < 17
+def en_sesion_par(symbol):
+    """
+    Filtro de sesión específico por par.
+    Solo operar cada par en su sesión de mayor liquidez.
 
-    # Lunes a Jueves — parate de 17:00 a 19:00 ART (cierre NY / apertura Sydney)
-    return not (17 <= hora < 19)
+    Sesiones (hora Argentina ART = UTC-3):
+    - Tokio:   00:00 - 09:00 ART  → USD/JPY, AUD/USD, NZD/USD
+    - Londres: 06:00 - 15:00 ART  → EUR/USD, GBP/USD, EUR/GBP, USD/CHF
+    - NY:      11:00 - 20:00 ART  → USD/CAD, USD/CHF, todos los majors
+    - Overlap: 11:00 - 15:00 ART  → mejor momento para todos
+
+    Commodities: válidos en cualquier sesión activa (siguen a NY principalmente)
+    """
+    hora = datetime.now(ARG_TZ).hour
+
+    # Sesión Londres + NY overlap (mejor para majors europeos)
+    sesion_londres = 6 <= hora < 15
+    sesion_ny      = 11 <= hora < 20
+    sesion_tokio   = 0 <= hora < 9
+
+    # Pares europeos — solo Londres o NY
+    if symbol in ("EURUSD", "GBPUSD", "EURGBP", "USDCHF"):
+        return sesion_londres or sesion_ny
+
+    # Pares asiáticos — Tokio o NY
+    if symbol in ("USDJPY", "AUDUSD", "NZDUSD"):
+        return sesion_tokio or sesion_ny
+
+    # USD/CAD — principalmente NY
+    if symbol == "USDCAD":
+        return sesion_ny
+
+    # Commodities — siguen a NY pero válidos en Londres también
+    if symbol in ("XAUUSD", "XAGUSD", "USOIL", "UKOIL"):
+        return sesion_londres or sesion_ny
+
+    # Default — cualquier sesión activa
+    return True
+
+
 
 # =============================================================================
 #   INDICADORES TÉCNICOS (misma lógica que el bot crypto)
@@ -805,6 +829,10 @@ def format_setup_fx(s, tf_label):
 
 def analyze_symbol_fx(symbol, symbol_yf, interval, tf_label):
     """Analiza un par Forex/Commodity y retorna lista de setups válidos"""
+    # Filtro de sesión específico por par — no operar fuera de horario de liquidez
+    if not en_sesion_par(symbol):
+        return None
+
     df = get_klines_fx(symbol_yf, interval, limit=200)
     if df is None: return None
     try:
