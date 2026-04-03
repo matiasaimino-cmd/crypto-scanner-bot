@@ -112,6 +112,27 @@ def init_db():
                 registrado_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tracking (
+                id            SERIAL PRIMARY KEY,
+                alerta_id     INTEGER,
+                symbol        VARCHAR(20),
+                direction     VARCHAR(10),
+                timeframe     VARCHAR(20),
+                precio_entry  FLOAT,
+                sl            FLOAT,
+                tp1           FLOAT,
+                tp2           FLOAT,
+                tp3           FLOAT,
+                score         FLOAT,
+                resultado     VARCHAR(10) DEFAULT 'OPEN',
+                tp_alcanzado  INTEGER DEFAULT 0,
+                precio_cierre FLOAT,
+                pnl_pct       FLOAT,
+                abierto_at    TIMESTAMP DEFAULT NOW(),
+                cerrado_at    TIMESTAMP
+            )
+        """)
         conn.commit()
         # Limpiar duplicados en market_state y crear constraint único
         try:
@@ -192,15 +213,204 @@ def guardar_alerta(s, tf_label):
             INSERT INTO alertas
                 (symbol, direction, timeframe, precio, rsi, score, sl, tp1, tp2, tp3, confluencias)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
         """, (
             s["symbol"], s["direction"], tf_label,
             float(s["price"]),  float(s["rsi"]),  float(s["score"]),
             float(s["sl"]),     float(s["tp1"]),  float(s["tp2"]),  float(s["tp3"]),
             " | ".join(s["labels"])
         ))
+        alerta_id = cur.fetchone()[0]
+        conn.commit()
+
+        # Crear registro de tracking para esta señal
+        cur.execute("""
+            INSERT INTO tracking
+                (alerta_id, symbol, direction, timeframe, precio_entry, sl, tp1, tp2, tp3, score)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            alerta_id, s["symbol"], s["direction"], tf_label,
+            float(s["price"]), float(s["sl"]),
+            float(s["tp1"]),   float(s["tp2"]),  float(s["tp3"]),
+            float(s["score"])
+        ))
         conn.commit()
     except Exception as e:
         print("Error guardar alerta: " + str(e))
+    finally:
+        conn.close()
+
+
+def verificar_resultados():
+    """
+    Verifica el resultado de las operaciones abiertas.
+    Por cada señal OPEN consulta el precio actual y determina si:
+    - Tocó SL → LOSS
+    - Llegó a TP1, TP2 o TP3 → WIN
+    - Pasaron más de 48hs sin resultado → EXPIRED
+    Se ejecuta en cada ciclo de escaneo.
+    """
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, symbol, direction, precio_entry, sl, tp1, tp2, tp3, abierto_at
+            FROM tracking
+            WHERE resultado = 'OPEN'
+        """)
+        operaciones = cur.fetchall()
+        if not operaciones: return
+
+        for op in operaciones:
+            op_id, symbol, direction, entry, sl, tp1, tp2, tp3, abierto_at = op
+            try:
+                # Obtener precio actual de Binance
+                r = _session.get(
+                    BINANCE_BASE + "/ticker/price",
+                    params={"symbol": symbol},
+                    timeout=5
+                )
+                precio_actual = float(r.json()["price"])
+
+                resultado     = None
+                tp_alcanzado  = 0
+                precio_cierre = precio_actual
+                pnl_pct       = 0.0
+
+                if direction == "LONG":
+                    if precio_actual <= sl:
+                        resultado = "LOSS"
+                        pnl_pct   = round((precio_actual - entry) / entry * 100, 2)
+                    elif precio_actual >= tp3:
+                        resultado = "WIN"; tp_alcanzado = 3
+                        pnl_pct   = round((precio_actual - entry) / entry * 100, 2)
+                    elif precio_actual >= tp2:
+                        resultado = "WIN"; tp_alcanzado = 2
+                        pnl_pct   = round((precio_actual - entry) / entry * 100, 2)
+                    elif precio_actual >= tp1:
+                        resultado = "WIN"; tp_alcanzado = 1
+                        pnl_pct   = round((precio_actual - entry) / entry * 100, 2)
+                else:  # SHORT
+                    if precio_actual >= sl:
+                        resultado = "LOSS"
+                        pnl_pct   = round((entry - precio_actual) / entry * 100, 2)
+                    elif precio_actual <= tp3:
+                        resultado = "WIN"; tp_alcanzado = 3
+                        pnl_pct   = round((entry - precio_actual) / entry * 100, 2)
+                    elif precio_actual <= tp2:
+                        resultado = "WIN"; tp_alcanzado = 2
+                        pnl_pct   = round((entry - precio_actual) / entry * 100, 2)
+                    elif precio_actual <= tp1:
+                        resultado = "WIN"; tp_alcanzado = 1
+                        pnl_pct   = round((entry - precio_actual) / entry * 100, 2)
+
+                # Expirar operaciones de más de 48hs sin resultado
+                if resultado is None:
+                    horas = (datetime.now(ARG_TZ) - abierto_at.replace(tzinfo=ARG_TZ)).total_seconds() / 3600
+                    if horas > 48:
+                        resultado     = "EXPIRED"
+                        precio_cierre = precio_actual
+                        pnl_pct       = round((entry - precio_actual) / entry * 100 * (-1 if direction == "LONG" else 1), 2)
+
+                # Actualizar en DB si hay resultado
+                if resultado:
+                    cur.execute("""
+                        UPDATE tracking
+                        SET resultado     = %s,
+                            tp_alcanzado  = %s,
+                            precio_cierre = %s,
+                            pnl_pct       = %s,
+                            cerrado_at    = NOW()
+                        WHERE id = %s
+                    """, (resultado, tp_alcanzado, precio_cierre, pnl_pct, op_id))
+                    conn.commit()
+
+                    # Notificar por Telegram si es WIN o LOSS
+                    if resultado in ("WIN", "LOSS"):
+                        emoji  = "✅" if resultado == "WIN" else "❌"
+                        emoji2 = "🟢" if direction == "LONG" else "🔴"
+                        msg    = emoji + " <b>" + resultado + "</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
+                        if resultado == "WIN":
+                            msg += "🎯 TP" + str(tp_alcanzado) + " alcanzado\n"
+                        else:
+                            msg += "🛑 SL tocado\n"
+                        msg += "📊 Entrada: " + fmt(entry) + " → " + fmt(precio_cierre) + "\n"
+                        msg += "💰 P&L: <b>" + ("+" if pnl_pct > 0 else "") + str(pnl_pct) + "%</b>"
+                        send_telegram(msg)
+                        print("Tracking: " + resultado + " " + symbol + " " + str(pnl_pct) + "%")
+
+            except Exception as e:
+                print("Error verificar " + symbol + ": " + str(e))
+                continue
+
+    except Exception as e:
+        print("Error verificar resultados: " + str(e))
+    finally:
+        conn.close()
+
+
+def reporte_tracking():
+    """
+    Genera reporte de rendimiento con todas las operaciones cerradas.
+    Comando: /reporte
+    """
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT resultado, COUNT(*), AVG(pnl_pct), MAX(pnl_pct), MIN(pnl_pct)
+            FROM tracking
+            WHERE resultado != 'OPEN'
+            GROUP BY resultado
+        """)
+        stats = cur.fetchall()
+
+        cur.execute("""
+            SELECT symbol, direction, timeframe, precio_entry, pnl_pct, resultado, tp_alcanzado, abierto_at
+            FROM tracking
+            WHERE resultado != 'OPEN'
+            ORDER BY abierto_at DESC
+            LIMIT 20
+        """)
+        ultimas = cur.fetchall()
+
+        if not stats:
+            send_telegram("📊 Sin operaciones cerradas todavía.")
+            return
+
+        # Calcular métricas generales
+        wins     = next((r for r in stats if r[0] == "WIN"),  (None, 0, 0, 0, 0))
+        losses   = next((r for r in stats if r[0] == "LOSS"), (None, 0, 0, 0, 0))
+        total    = sum(r[1] for r in stats if r[0] in ("WIN", "LOSS"))
+        win_rate = round(wins[1] / total * 100, 1) if total > 0 else 0
+
+        msg  = "📊 <b>REPORTE DE RENDIMIENTO</b>\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "Total operaciones: <b>" + str(total) + "</b>\n"
+        msg += "✅ Ganadoras: <b>" + str(wins[1]) + "</b> (" + str(win_rate) + "%)\n"
+        msg += "❌ Perdedoras: <b>" + str(losses[1]) + "</b>\n"
+        if wins[2]: msg += "💰 P&L prom WIN:  <b>+" + str(round(wins[2], 2)) + "%</b>\n"
+        if losses[2]: msg += "💸 P&L prom LOSS: <b>" + str(round(losses[2], 2)) + "%</b>\n"
+        msg += "\n📋 <b>Últimas 20 operaciones:</b>\n"
+
+        for row in ultimas:
+            symbol, direction, tf, entry, pnl, resultado, tp, fecha = row
+            if resultado == "WIN":
+                emoji = "✅ TP" + str(tp)
+            elif resultado == "LOSS":
+                emoji = "❌ SL"
+            else:
+                emoji = "⏰ EXP"
+            dir_emoji = "🟢" if direction == "LONG" else "🔴"
+            pnl_str   = ("+" if pnl and pnl > 0 else "") + str(round(pnl, 2)) + "%" if pnl else "?"
+            msg += dir_emoji + " " + symbol + " " + emoji + " " + pnl_str
+            msg += " — " + fecha.strftime("%d/%m %H:%M") + "\n"
+
+        send_telegram(msg)
+    except Exception as e:
+        print("Error reporte tracking: " + str(e))
     finally:
         conn.close()
 
@@ -329,12 +539,16 @@ def procesar_comandos(last_update_id):
         elif text == "/backtest":
             print("Comando /backtest recibido")
             run_backtest()
+        elif text == "/reporte":
+            print("Comando /reporte recibido")
+            reporte_tracking()
         elif text == "/ayuda":
             send_telegram(
                 "🤖 <b>Comandos disponibles:</b>\n\n"
                 "/resumen   — últimas 20 alertas\n"
                 "/scan      — escaneo inmediato\n"
                 "/backtest  — backtesting del último mes\n"
+                "/reporte   — rendimiento de operaciones\n"
                 "/ayuda     — esta ayuda"
             )
     return last_update_id
@@ -960,7 +1174,19 @@ def calc_sl_tp(price, direction, support, resistance, df=None):
         except:
             sl = None
 
-    # Fallback al S/R estático si no se encontró swing válido
+    # Fallback — usar el máximo/mínimo de las últimas 10 velas + buffer
+    # Más inteligente que el S/R estático cuando no hay swing válido
+    if sl is None:
+        if df is not None:
+            try:
+                if direction == "LONG":
+                    sl = round(df["low"].iloc[-10:].min() * 0.997, 6)
+                else:
+                    sl = round(df["high"].iloc[-10:].max() * 1.003, 6)
+            except:
+                sl = None
+
+    # Último fallback al S/R estático
     if sl is None:
         if direction == "LONG":
             sl = round(support * 0.997, 6)
@@ -1568,6 +1794,7 @@ if __name__ == "__main__":
     )
     scan_all()
     schedule.every(5).minutes.do(scan_all)
+    schedule.every(5).minutes.do(verificar_resultados)
     schedule.every().day.at("08:00").do(resumen_diario)
     last_update_id = None
     while True:
