@@ -906,22 +906,23 @@ def calc_score(direction, rsi, ob, fvg, structure, patterns, vol_high, near_sr, 
 
 def calc_sl_tp(price, direction, support, resistance, df=None):
     """
-    SL basado en el swing high/low más reciente — más inteligente que S/R estático.
+    SL basado en el swing high/low más relevante.
 
-    Para SHORT: SL por encima del último swing high + 0.2% buffer
-    Para LONG:  SL por debajo del último swing low  - 0.2% buffer
+    Para SHORT: SL por encima del swing high más alto de las últimas 50 velas
+                que esté por encima del precio de entrada + 0.2% buffer.
+    Para LONG:  SL por debajo del swing low más bajo de las últimas 50 velas
+                que esté por debajo del precio de entrada - 0.2% buffer.
 
-    Si el swing está muy lejos (>3%) usa el S/R estático como fallback.
+    Si el swing está muy lejos (>4%) usa el S/R estático como fallback.
     TPs: ratios 1:1.5, 1:2.5, 1:4.0
     """
     sl = None
 
-    # Intentar usar swing high/low del DataFrame
     if df is not None:
         try:
             if direction == "SHORT":
-                # Buscar el swing high más reciente en las últimas 30 velas
-                recent = df.iloc[-30:]
+                # Buscar swing highs en las últimas 50 velas
+                recent = df.iloc[-50:]
                 swing_highs = []
                 for i in range(2, len(recent)-2):
                     if (recent["high"].iloc[i] > recent["high"].iloc[i-1] and
@@ -929,16 +930,18 @@ def calc_sl_tp(price, direction, support, resistance, df=None):
                         recent["high"].iloc[i] > recent["high"].iloc[i-2] and
                         recent["high"].iloc[i] > recent["high"].iloc[i+2]):
                         swing_highs.append(recent["high"].iloc[i])
-                if swing_highs:
-                    swing_h = max(swing_highs[-3:])  # el más alto de los últimos 3 swings
-                    sl_candidato = round(swing_h * 1.002, 6)  # buffer 0.2%
-                    # Validar que no sea más del 3% del precio
-                    if (sl_candidato - price) / price <= 0.03:
+
+                # Tomar el swing high más alto que esté por encima del precio
+                highs_sobre_precio = [h for h in swing_highs if h > price]
+                if highs_sobre_precio:
+                    swing_h = max(highs_sobre_precio)
+                    sl_candidato = round(swing_h * 1.002, 6)
+                    if (sl_candidato - price) / price <= 0.04:
                         sl = sl_candidato
 
             else:  # LONG
-                # Buscar el swing low más reciente en las últimas 30 velas
-                recent = df.iloc[-30:]
+                # Buscar swing lows en las últimas 50 velas
+                recent = df.iloc[-50:]
                 swing_lows = []
                 for i in range(2, len(recent)-2):
                     if (recent["low"].iloc[i] < recent["low"].iloc[i-1] and
@@ -946,11 +949,13 @@ def calc_sl_tp(price, direction, support, resistance, df=None):
                         recent["low"].iloc[i] < recent["low"].iloc[i-2] and
                         recent["low"].iloc[i] < recent["low"].iloc[i+2]):
                         swing_lows.append(recent["low"].iloc[i])
-                if swing_lows:
-                    swing_l = min(swing_lows[-3:])  # el más bajo de los últimos 3 swings
-                    sl_candidato = round(swing_l * 0.998, 6)  # buffer 0.2%
-                    # Validar que no sea más del 3% del precio
-                    if (price - sl_candidato) / price <= 0.03:
+
+                # Tomar el swing low más bajo que esté por debajo del precio
+                lows_bajo_precio = [l for l in swing_lows if l < price]
+                if lows_bajo_precio:
+                    swing_l = min(lows_bajo_precio)
+                    sl_candidato = round(swing_l * 0.998, 6)
+                    if (price - sl_candidato) / price <= 0.04:
                         sl = sl_candidato
         except:
             sl = None
