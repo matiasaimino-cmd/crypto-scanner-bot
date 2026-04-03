@@ -305,13 +305,28 @@ def verificar_resultados():
                         resultado = "WIN"; tp_alcanzado = 1
                         pnl_pct   = round((entry - precio_actual) / entry * 100, 2)
 
-                # Expirar operaciones de más de 48hs sin resultado
+                # Expirar operaciones según timeframe
+                # 15m → 24hs | 1H → 5 días | 4H → 10 días
                 if resultado is None:
+                    cur2 = conn.cursor()
+                    cur2.execute("SELECT timeframe FROM tracking WHERE id = %s", (op_id,))
+                    row = cur2.fetchone()
+                    tf = row[0] if row else ""
+                    if "15m" in tf or "Scalping" in tf:
+                        max_horas = 24
+                    elif "4H" in tf or "4h" in tf:
+                        max_horas = 240
+                    else:
+                        max_horas = 120  # 1H → 5 días
+
                     horas = (datetime.now(ARG_TZ) - abierto_at.replace(tzinfo=ARG_TZ)).total_seconds() / 3600
-                    if horas > 48:
+                    if horas > max_horas:
                         resultado     = "EXPIRED"
                         precio_cierre = precio_actual
-                        pnl_pct       = round((entry - precio_actual) / entry * 100 * (-1 if direction == "LONG" else 1), 2)
+                        if direction == "LONG":
+                            pnl_pct = round((precio_actual - entry) / entry * 100, 2)
+                        else:
+                            pnl_pct = round((entry - precio_actual) / entry * 100, 2)
 
                 # Actualizar en DB si hay resultado
                 if resultado:
