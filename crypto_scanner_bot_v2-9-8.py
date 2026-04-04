@@ -223,17 +223,26 @@ def guardar_alerta(s, tf_label):
         alerta_id = cur.fetchone()[0]
         conn.commit()
 
-        # Crear registro de tracking para esta señal
+        # Crear registro de tracking solo si no hay ya uno OPEN del mismo par/dirección
         cur.execute("""
-            INSERT INTO tracking
-                (alerta_id, symbol, direction, timeframe, precio_entry, sl, tp1, tp2, tp3, score)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            alerta_id, s["symbol"], s["direction"], tf_label,
-            float(s["price"]), float(s["sl"]),
-            float(s["tp1"]),   float(s["tp2"]),  float(s["tp3"]),
-            float(s["score"])
-        ))
+            SELECT COUNT(*) FROM tracking
+            WHERE symbol    = %s
+              AND direction = %s
+              AND resultado = 'OPEN'
+        """, (s["symbol"], s["direction"]))
+        ya_open = cur.fetchone()[0] > 0
+
+        if not ya_open:
+            cur.execute("""
+                INSERT INTO tracking
+                    (alerta_id, symbol, direction, timeframe, precio_entry, sl, tp1, tp2, tp3, score)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                alerta_id, s["symbol"], s["direction"], tf_label,
+                float(s["price"]), float(s["sl"]),
+                float(s["tp1"]),   float(s["tp2"]),  float(s["tp3"]),
+                float(s["score"])
+            ))
         conn.commit()
     except Exception as e:
         print("Error guardar alerta: " + str(e))
@@ -342,6 +351,7 @@ def verificar_resultados():
                     conn.commit()
 
                     # Notificar por Telegram si es WIN o LOSS
+                    # Evitar duplicados del mismo símbolo en el mismo ciclo
                     if resultado in ("WIN", "LOSS"):
                         emoji  = "✅" if resultado == "WIN" else "❌"
                         emoji2 = "🟢" if direction == "LONG" else "🔴"
