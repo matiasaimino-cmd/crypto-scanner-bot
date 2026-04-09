@@ -125,6 +125,7 @@ def init_db():
                 tp2           FLOAT,
                 tp3           FLOAT,
                 score         FLOAT,
+                condicion     VARCHAR(20) DEFAULT 'TENDENCIA',
                 resultado     VARCHAR(10) DEFAULT 'OPEN',
                 tp_alcanzado  INTEGER DEFAULT 0,
                 precio_cierre FLOAT,
@@ -236,13 +237,13 @@ def guardar_alerta(s, tf_label):
         if not ya_open:
             cur.execute("""
                 INSERT INTO tracking
-                    (alerta_id, symbol, direction, timeframe, precio_entry, sl, tp1, tp2, tp3, score)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (alerta_id, symbol, direction, timeframe, precio_entry, sl, tp1, tp2, tp3, score, condicion)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 alerta_id, s["symbol"], s["direction"], tf_label,
                 float(s["price"]), float(s["sl"]),
                 float(s["tp1"]),   float(s["tp2"]),  float(s["tp3"]),
-                float(s["score"])
+                float(s["score"]), s.get("condicion_mercado", "TENDENCIA")
             ))
         conn.commit()
     except Exception as e:
@@ -287,6 +288,18 @@ def verificar_resultados():
                 tp_alcanzado  = 0
                 precio_cierre = precio_actual
                 pnl_pct       = 0.0
+
+                # Trailing stop — mover SL si la operación está ganando
+                try:
+                    df_trail      = get_klines(symbol, "1h", limit=30)
+                    atr_pct_trail = calc_atr(df_trail) if df_trail is not None else 1.0
+                    nuevo_sl      = calcular_trailing_sl(direction, precio_actual, entry, sl, atr_pct_trail)
+                    if nuevo_sl != sl:
+                        cur.execute("UPDATE tracking SET sl = %s WHERE id = %s", (nuevo_sl, op_id))
+                        conn.commit()
+                        sl = nuevo_sl
+                except Exception as e:
+                    print("Error trailing stop " + symbol + ": " + str(e))
 
                 if direction == "LONG":
                     if precio_actual <= sl:
@@ -385,6 +398,7 @@ def verificar_resultados():
 def reporte_tracking():
     """
     Genera reporte de rendimiento con todas las operaciones cerradas.
+    Incluye análisis por condición de mercado (TENDENCIA/RANGO/ALTA_VOLATILIDAD).
     Comando: /reporte
     """
     conn = get_db()
@@ -393,26 +407,31 @@ def reporte_tracking():
         cur = conn.cursor()
         cur.execute("""
             SELECT resultado, COUNT(*), AVG(pnl_pct), MAX(pnl_pct), MIN(pnl_pct)
-            FROM tracking
-            WHERE resultado != 'OPEN'
-            GROUP BY resultado
+            FROM tracking WHERE resultado != 'OPEN' GROUP BY resultado
         """)
         stats = cur.fetchall()
 
         cur.execute("""
             SELECT symbol, direction, timeframe, precio_entry, pnl_pct, resultado, tp_alcanzado, abierto_at
-            FROM tracking
-            WHERE resultado != 'OPEN'
-            ORDER BY abierto_at DESC
-            LIMIT 20
+            FROM tracking WHERE resultado != 'OPEN'
+            ORDER BY abierto_at DESC LIMIT 20
         """)
         ultimas = cur.fetchall()
+
+        # Por condición de mercado
+        cur.execute("""
+            SELECT condicion,
+                   COUNT(*) FILTER (WHERE resultado = 'WIN') as wins,
+                   COUNT(*) FILTER (WHERE resultado = 'LOSS') as losses
+            FROM tracking WHERE resultado != 'OPEN'
+            GROUP BY condicion
+        """)
+        por_condicion = cur.fetchall()
 
         if not stats:
             send_telegram("📊 Sin operaciones cerradas todavía.")
             return
 
-        # Calcular métricas generales
         wins     = next((r for r in stats if r[0] == "WIN"),  (None, 0, 0, 0, 0))
         losses   = next((r for r in stats if r[0] == "LOSS"), (None, 0, 0, 0, 0))
         total    = sum(r[1] for r in stats if r[0] in ("WIN", "LOSS"))
@@ -423,18 +442,25 @@ def reporte_tracking():
         msg += "Total operaciones: <b>" + str(total) + "</b>\n"
         msg += "✅ Ganadoras: <b>" + str(wins[1]) + "</b> (" + str(win_rate) + "%)\n"
         msg += "❌ Perdedoras: <b>" + str(losses[1]) + "</b>\n"
-        if wins[2]: msg += "💰 P&L prom WIN:  <b>+" + str(round(wins[2], 2)) + "%</b>\n"
+        if wins[2]:   msg += "💰 P&L prom WIN:  <b>+" + str(round(wins[2], 2)) + "%</b>\n"
         if losses[2]: msg += "💸 P&L prom LOSS: <b>" + str(round(losses[2], 2)) + "%</b>\n"
-        msg += "\n📋 <b>Últimas 20 operaciones:</b>\n"
 
+        # Análisis por condición de mercado
+        if por_condicion:
+            msg += "\n🌡 <b>POR CONDICIÓN DE MERCADO:</b>\n"
+            for row in por_condicion:
+                condicion, w, l = row
+                tot_c = (w or 0) + (l or 0)
+                wr_c  = round((w or 0) / tot_c * 100, 1) if tot_c > 0 else 0
+                emoji = "📈" if condicion == "TENDENCIA" else ("📊" if condicion == "RANGO" else "⚡")
+                msg += emoji + " " + (condicion or "?") + ": " + str(tot_c) + " ops — <b>" + str(wr_c) + "%</b>\n"
+
+        msg += "\n📋 <b>Últimas 20 operaciones:</b>\n"
         for row in ultimas:
             symbol, direction, tf, entry, pnl, resultado, tp, fecha = row
-            if resultado == "WIN":
-                emoji = "✅ TP" + str(tp)
-            elif resultado == "LOSS":
-                emoji = "❌ SL"
-            else:
-                emoji = "⏰ EXP"
+            if resultado == "WIN":   emoji = "✅ TP" + str(tp)
+            elif resultado == "LOSS": emoji = "❌ SL"
+            else:                    emoji = "⏰ EXP"
             dir_emoji = "🟢" if direction == "LONG" else "🔴"
             pnl_str   = ("+" if pnl and pnl > 0 else "") + str(round(pnl, 2)) + "%" if pnl else "?"
             msg += dir_emoji + " " + symbol + " " + emoji + " " + pnl_str
@@ -442,7 +468,7 @@ def reporte_tracking():
 
         send_telegram(msg)
     except Exception as e:
-        print("Error reporte tracking: " + str(e))
+        print("Error reporte_tracking: " + str(e))
     finally:
         conn.close()
 
@@ -1109,6 +1135,66 @@ def calc_volatility(df):
     except:
         return 0.0
 
+
+def calc_atr(df, period=14):
+    """
+    Average True Range — mide la volatilidad real del activo.
+    Retorna el ATR como % del precio para comparar entre activos.
+    """
+    try:
+        high  = df["high"]
+        low   = df["low"]
+        close = df["close"]
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low  - prev_close).abs()
+        ], axis=1).max(axis=1)
+        atr     = tr.ewm(span=period, adjust=False).mean().iloc[-1]
+        atr_pct = round(atr / close.iloc[-1] * 100, 3)
+        return atr_pct
+    except:
+        return 0.0
+
+
+def tiene_direccionalidad(df, period=14):
+    """
+    Filtra activos sin direccionalidad usando ADX simplificado.
+    Compara el movimiento direccional (DM) con el rango total (ATR).
+
+    Retorna True si el activo tiene suficiente direccionalidad para operar.
+    Retorna False si está en rango sin tendencia (evitar sobreoperación).
+
+    Umbral: si el movimiento neto de las últimas N velas es menor al
+    30% del ATR acumulado → mercado en rango → no operar.
+    """
+    try:
+        n          = min(period, len(df) - 1)
+        precio_ini = df["close"].iloc[-n]
+        precio_fin = df["close"].iloc[-1]
+        movimiento_neto = abs(precio_fin - precio_ini) / precio_ini * 100
+
+        # ATR acumulado del período
+        high  = df["high"]
+        low   = df["low"]
+        close = df["close"]
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low  - prev_close).abs()
+        ], axis=1).max(axis=1)
+        atr_sum = tr.iloc[-n:].sum() / close.iloc[-1] * 100
+
+        if atr_sum == 0: return True
+        ratio = movimiento_neto / atr_sum
+
+        # Si el precio se movió menos del 25% del rango total → sin direccionalidad
+        return ratio >= 0.25
+    except:
+        return True  # en caso de error, no bloquear
+
 # =============================================================================
 #   SCORING Y CLASIFICACIÓN
 # =============================================================================
@@ -1263,6 +1349,50 @@ def calc_sl_tp(price, direction, support, resistance, df=None):
 
     return sl, tp1, tp2, tp3, round(abs(tp1-price)/risk, 1), round(abs(tp2-price)/risk, 1)
 
+
+def calcular_trailing_sl(direction, precio_actual, precio_entry, sl_original, atr_pct):
+    """
+    Trailing stop — mueve el SL a favor cuando la operación está ganando.
+    Se activa cuando el precio supera el TP1 (50% del camino al TP2).
+
+    Lógica:
+    - Cuando gana más del 1.5× riesgo → mover SL a breakeven
+    - Cuando gana más del 2.5× riesgo → mover SL a TP1
+    - Cuando gana más del 3.5× riesgo → mover SL a TP2
+    - Trailing basado en ATR para no quedar muy ajustado
+    """
+    try:
+        riesgo_original = abs(precio_entry - sl_original)
+        if riesgo_original == 0: return sl_original
+        ganancia_actual = abs(precio_actual - precio_entry)
+        multiplicador   = ganancia_actual / riesgo_original
+
+        atr_abs = precio_entry * (atr_pct / 100)
+
+        if direction == "LONG":
+            if multiplicador >= 3.5:
+                # Trailing en TP2 — mover SL a precio_entry + 2.5× riesgo
+                nuevo_sl = precio_actual - atr_abs * 1.5
+                return round(max(nuevo_sl, precio_entry + riesgo_original * 2.5), 6)
+            elif multiplicador >= 2.5:
+                # Mover SL a TP1
+                return round(precio_entry + riesgo_original * 2.0, 6)
+            elif multiplicador >= 1.5:
+                # Mover SL a breakeven
+                return round(precio_entry + riesgo_original * 0.1, 6)
+        else:  # SHORT
+            if multiplicador >= 3.5:
+                nuevo_sl = precio_actual + atr_abs * 1.5
+                return round(min(nuevo_sl, precio_entry - riesgo_original * 2.5), 6)
+            elif multiplicador >= 2.5:
+                return round(precio_entry - riesgo_original * 2.0, 6)
+            elif multiplicador >= 1.5:
+                return round(precio_entry - riesgo_original * 0.1, 6)
+
+        return sl_original
+    except:
+        return sl_original
+
 # =============================================================================
 #   FORMATO DE MENSAJES TELEGRAM
 # =============================================================================
@@ -1376,6 +1506,8 @@ def analyze_symbol(symbol, interval):
         candles                  = detect_candle(df)
         vol_r, vol_h             = calc_vol(df)
         vol                      = calc_volatility(df)
+        atr_pct                  = calc_atr(df)
+        direccional              = tiene_direccionalidad(df)
         divergence               = detect_rsi_divergence(df)
         htf_bias                 = get_htf_bias(symbol, interval)
         bias_1h                  = get_1h_bias(symbol) if interval == "15m" else None
@@ -1385,6 +1517,10 @@ def analyze_symbol(symbol, interval):
         near_sup                 = abs(price - sup) / price < 0.01
         near_res                 = abs(price - res) / price < 0.01
 
+        # Condición de mercado para registro
+        condicion_mercado = "TENDENCIA" if direccional else "RANGO"
+        if atr_pct > 2.0: condicion_mercado = "ALTA_VOLATILIDAD"
+
         # ── Guardar estado en DB ─────────────────────────────────────────────
         guardar_estado(symbol, interval, rsi, structure, htf_bias, divergence, price)
         guardar_rsi(symbol, interval, rsi, price)
@@ -1393,6 +1529,9 @@ def analyze_symbol(symbol, interval):
         for direction, ob, fvg, near in [("LONG", ob_b, fv_b, near_sup), ("SHORT", ob_s, fv_s, near_res)]:
 
             # ── FILTROS DE ENTRADA ───────────────────────────────────────────
+
+            # 0. Filtro ATR — no operar activos sin direccionalidad (en rango)
+            if not direccional: continue
 
             # 1. RSI direccional
             if direction == "SHORT" and rsi < 50 and rsi < RSI_EXTREME: continue
@@ -1511,11 +1650,13 @@ def analyze_symbol(symbol, interval):
                 "rr1":         rr1,
                 "rr2":         rr2,
                 "volatility":  vol,
-                "tipo_setup":  tipo_setup,
-                "hh_ll_type":  hh_ll_type,
-                "hh_ll_level": hh_ll_level,
-                "fib_nivel":   fib_nivel if fib_valido else None,
-                "fib_desc":    fib_desc  if fib_valido else None,
+                "tipo_setup":        tipo_setup,
+                "hh_ll_type":        hh_ll_type,
+                "hh_ll_level":       hh_ll_level,
+                "fib_nivel":         fib_nivel if fib_valido else None,
+                "fib_desc":          fib_desc  if fib_valido else None,
+                "condicion_mercado": condicion_mercado,
+                "atr_pct":           atr_pct,
             })
 
         return results if results else None
@@ -1547,6 +1688,37 @@ def scan_all():
             time.sleep(0.15)
 
     all_setups.sort(key=lambda x: x["score"], reverse=True)
+
+    # ── Filtro de correlación — máx 2 altcoins correlacionadas simultáneas ──
+    # Grupos de alta correlación entre sí
+    GRUPOS_CORRELACION = [
+        {"SOLUSDT", "AVAXUSDT", "DOTUSDT", "NEARUSDT", "ATOMUSDT"},  # L1s
+        {"ADAUSDT", "XRPUSDT", "LTCUSDT"},                            # payments
+        {"SANDUSDT", "MANAUSDT", "OPUSDT"},                           # metaverse/gaming
+        {"PEPEUSDT", "DOGEUSDT"},                                      # memecoins
+        {"RENDERUSDT", "FTMUSDT", "THETAUSDT"},                       # infra/tech
+    ]
+
+    def filtrar_correlacion(setups):
+        seleccionados = []
+        conteo_grupo  = {i: 0 for i in range(len(GRUPOS_CORRELACION))}
+        for s in setups:
+            sym = s["symbol"]
+            # Verificar si pertenece a algún grupo correlacionado
+            en_grupo = None
+            for idx, grupo in enumerate(GRUPOS_CORRELACION):
+                if sym in grupo:
+                    en_grupo = idx
+                    break
+            # Si está en un grupo, máximo 2 del mismo grupo
+            if en_grupo is not None:
+                if conteo_grupo[en_grupo] >= 2:
+                    continue  # ya hay 2 del mismo grupo — descartar
+                conteo_grupo[en_grupo] += 1
+            seleccionados.append(s)
+        return seleccionados
+
+    all_setups = filtrar_correlacion(all_setups)
 
     msg  = "🔍 <b>SCANNER v4.3 — " + now + "</b>\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
