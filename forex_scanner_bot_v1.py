@@ -122,9 +122,27 @@ def init_db():
                 CONSTRAINT fx_market_state_unique UNIQUE (symbol, timeframe)
             )
         """)
-        conn.commit()
-
-        # Limpiar duplicados y crear constraint si no existe
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS fx_tracking (
+                id            SERIAL PRIMARY KEY,
+                alerta_id     INTEGER,
+                symbol        VARCHAR(20),
+                direction     VARCHAR(10),
+                timeframe     VARCHAR(20),
+                precio_entry  FLOAT,
+                sl            FLOAT,
+                tp1           FLOAT,
+                tp2           FLOAT,
+                tp3           FLOAT,
+                score         FLOAT,
+                resultado     VARCHAR(10) DEFAULT 'OPEN',
+                tp_alcanzado  INTEGER DEFAULT 0,
+                precio_cierre FLOAT,
+                pnl_pct       FLOAT,
+                abierto_at    TIMESTAMPTZ DEFAULT NOW(),
+                cerrado_at    TIMESTAMPTZ
+            )
+        """)
         try:
             cur.execute("""
                 DELETE FROM fx_market_state
@@ -172,15 +190,163 @@ def guardar_alerta_fx(s, tf_label):
             INSERT INTO fx_alertas
                 (symbol, direction, timeframe, precio, rsi, score, sl, tp1, tp2, tp3, confluencias)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
         """, (
             s["symbol"], s["direction"], tf_label,
             float(s["price"]), float(s["rsi"]), float(s["score"]),
             float(s["sl"]),    float(s["tp1"]), float(s["tp2"]),  float(s["tp3"]),
             " | ".join(s["labels"])
         ))
+        alerta_id = cur.fetchone()[0]
+        conn.commit()
+
+        # Crear tracking solo si no hay uno OPEN del mismo par/dirección/timeframe
+        cur.execute("""
+            SELECT COUNT(*) FROM fx_tracking
+            WHERE symbol    = %s
+              AND direction = %s
+              AND timeframe = %s
+              AND resultado = 'OPEN'
+        """, (s["symbol"], s["direction"], tf_label))
+        if cur.fetchone()[0] == 0:
+            cur.execute("""
+                INSERT INTO fx_tracking
+                    (alerta_id, symbol, direction, timeframe, precio_entry, sl, tp1, tp2, tp3, score)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                alerta_id, s["symbol"], s["direction"], tf_label,
+                float(s["price"]), float(s["sl"]),
+                float(s["tp1"]),   float(s["tp2"]), float(s["tp3"]),
+                float(s["score"])
+            ))
         conn.commit()
     except Exception as e:
         print("Error guardar alerta FX: " + str(e))
+    finally:
+        conn.close()
+
+
+def verificar_resultados_fx():
+    """Verifica resultados de operaciones Forex abiertas y notifica por Telegram"""
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, symbol, direction, precio_entry, sl, tp1, tp2, tp3, abierto_at, timeframe
+            FROM fx_tracking WHERE resultado = 'OPEN'
+        """)
+        operaciones = cur.fetchall()
+        if not operaciones: return
+
+        for op in operaciones:
+            op_id, symbol, direction, entry, sl, tp1, tp2, tp3, abierto_at, tf = op
+            try:
+                symbol_yf = SYMBOLS.get(symbol)
+                if not symbol_yf: continue
+                df = get_klines_fx(symbol_yf, "1h", limit=5)
+                if df is None: continue
+                precio_actual = float(df["close"].iloc[-1])
+
+                resultado = None; tp_alcanzado = 0; pnl_pct = 0.0
+
+                if direction == "LONG":
+                    if precio_actual <= sl:
+                        resultado = "LOSS"; pnl_pct = round((precio_actual - entry) / entry * 100, 2)
+                    elif precio_actual >= tp3:
+                        resultado = "WIN"; tp_alcanzado = 3; pnl_pct = round((precio_actual - entry) / entry * 100, 2)
+                    elif precio_actual >= tp2:
+                        resultado = "WIN"; tp_alcanzado = 2; pnl_pct = round((precio_actual - entry) / entry * 100, 2)
+                    elif precio_actual >= tp1:
+                        resultado = "WIN"; tp_alcanzado = 1; pnl_pct = round((precio_actual - entry) / entry * 100, 2)
+                else:
+                    if precio_actual >= sl:
+                        resultado = "LOSS"; pnl_pct = round((entry - precio_actual) / entry * 100, 2)
+                    elif precio_actual <= tp3:
+                        resultado = "WIN"; tp_alcanzado = 3; pnl_pct = round((entry - precio_actual) / entry * 100, 2)
+                    elif precio_actual <= tp2:
+                        resultado = "WIN"; tp_alcanzado = 2; pnl_pct = round((entry - precio_actual) / entry * 100, 2)
+                    elif precio_actual <= tp1:
+                        resultado = "WIN"; tp_alcanzado = 1; pnl_pct = round((entry - precio_actual) / entry * 100, 2)
+
+                # Expirar según timeframe
+                if resultado is None:
+                    now_tz = datetime.now(ARG_TZ)
+                    abierto_tz = abierto_at if abierto_at.tzinfo else abierto_at.replace(tzinfo=ARG_TZ)
+                    horas = (now_tz - abierto_tz).total_seconds() / 3600
+                    max_horas = 24 if "1H" in tf else 120
+                    if horas > max_horas:
+                        resultado = "EXPIRED"
+                        pnl_pct = round((entry - precio_actual) / entry * 100 * (-1 if direction == "LONG" else 1), 2)
+
+                if resultado:
+                    cur.execute("""
+                        UPDATE fx_tracking SET resultado=%s, tp_alcanzado=%s,
+                        precio_cierre=%s, pnl_pct=%s, cerrado_at=NOW() WHERE id=%s
+                    """, (resultado, tp_alcanzado, precio_actual, pnl_pct, op_id))
+                    conn.commit()
+                    if resultado in ("WIN", "LOSS"):
+                        emoji  = "✅" if resultado == "WIN" else "❌"
+                        emoji2 = "🟢" if direction == "LONG" else "🔴"
+                        msg = emoji + " <b>" + resultado + "</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
+                        if resultado == "WIN": msg += "🎯 TP" + str(tp_alcanzado) + " alcanzado\n"
+                        else:                  msg += "🛑 SL tocado\n"
+                        msg += "📊 Entrada: " + fmt_fx(entry) + " → " + fmt_fx(precio_actual) + "\n"
+                        msg += "💰 P&L: <b>" + ("+" if pnl_pct > 0 else "") + str(pnl_pct) + "%</b>"
+                        send_telegram(msg)
+            except Exception as e:
+                print("Error verificar FX " + symbol + ": " + str(e))
+    except Exception as e:
+        print("Error verificar_resultados_fx: " + str(e))
+    finally:
+        conn.close()
+
+
+def reporte_tracking_fx():
+    """Reporte de rendimiento del bot Forex — comando /fxreporte"""
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT resultado, COUNT(*), AVG(pnl_pct), MAX(pnl_pct), MIN(pnl_pct)
+            FROM fx_tracking WHERE resultado != 'OPEN' GROUP BY resultado
+        """)
+        stats  = cur.fetchall()
+        cur.execute("""
+            SELECT symbol, direction, timeframe, precio_entry, pnl_pct, resultado, tp_alcanzado, abierto_at
+            FROM fx_tracking WHERE resultado != 'OPEN' ORDER BY abierto_at DESC LIMIT 20
+        """)
+        ultimas = cur.fetchall()
+
+        if not stats:
+            send_telegram("📊 Sin operaciones Forex cerradas todavía.")
+            return
+
+        wins   = next((r for r in stats if r[0] == "WIN"),  (None, 0, 0, 0, 0))
+        losses = next((r for r in stats if r[0] == "LOSS"), (None, 0, 0, 0, 0))
+        total  = sum(r[1] for r in stats if r[0] in ("WIN", "LOSS"))
+        wr     = round(wins[1] / total * 100, 1) if total > 0 else 0
+
+        msg  = "📊 <b>REPORTE FOREX</b>\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "Total: <b>" + str(total) + "</b> operaciones\n"
+        msg += "✅ Ganadoras: <b>" + str(wins[1]) + "</b> (" + str(wr) + "%)\n"
+        msg += "❌ Perdedoras: <b>" + str(losses[1]) + "</b>\n"
+        if wins[2]:   msg += "💰 P&L prom WIN:  <b>+" + str(round(wins[2], 2)) + "%</b>\n"
+        if losses[2]: msg += "💸 P&L prom LOSS: <b>" + str(round(losses[2], 2)) + "%</b>\n"
+        msg += "\n📋 <b>Últimas 20:</b>\n"
+        for row in ultimas:
+            symbol, direction, tf, entry, pnl, resultado, tp, fecha = row
+            if resultado == "WIN":   emoji = "✅ TP" + str(tp)
+            elif resultado == "LOSS": emoji = "❌ SL"
+            else:                    emoji = "⏰ EXP"
+            dir_emoji = "🟢" if direction == "LONG" else "🔴"
+            pnl_str = ("+" if pnl and pnl > 0 else "") + str(round(pnl, 2)) + "%" if pnl else "?"
+            msg += dir_emoji + " " + symbol + " " + emoji + " " + pnl_str + " — " + fecha.strftime("%d/%m %H:%M") + "\n"
+        send_telegram(msg)
+    except Exception as e:
+        print("Error reporte_tracking_fx: " + str(e))
     finally:
         conn.close()
 
@@ -253,12 +419,15 @@ def procesar_comandos(last_update_id):
         elif text == "/fxscan":
             send_telegram("🔄 Iniciando escaneo Forex...")
             scan_all_fx()
+        elif text == "/fxreporte":
+            reporte_tracking_fx()
         elif text == "/fxayuda":
             send_telegram(
                 "💱 <b>Forex Scanner — Comandos:</b>\n\n"
-                "/fxresumen — últimas 20 alertas\n"
-                "/fxscan    — escaneo inmediato\n"
-                "/fxayuda   — esta ayuda"
+                "/fxresumen  — últimas 20 alertas\n"
+                "/fxscan     — escaneo inmediato\n"
+                "/fxreporte  — rendimiento de operaciones\n"
+                "/fxayuda    — esta ayuda"
             )
     return last_update_id
 
@@ -758,12 +927,34 @@ def calc_score(direction, rsi, ob, fvg, structure, patterns, vol_high, near_sr, 
     return round(min(max(score, 0), 10)), labels
 
 
-def calc_sl_tp_fx(price, direction, support, resistance, df=None):
+def calc_sl_tp_fx(price, direction, support, resistance, df=None, symbol=""):
     """
-    SL basado en swing high/low más relevante por encima/debajo del precio.
-    Buffer 0.1% para Forex. Máximo 2% de distancia.
-    TPs: R:R 1:1.5, 1:2.5, 1:4.0
+    SL basado en swing high/low más relevante.
+    Buffer dinámico según tipo de activo:
+    - JPY pairs → 0.15% (precio ~150, 0.1% = 0.15 pips, muy ajustado)
+    - Commodities (oro, petróleo) → 0.3% (movimientos más amplios)
+    - Forex majors → 0.1%
+    Máximo de distancia dinámico: 3% commodities, 1.5% forex
+    TPs: R:R 1:2, 1:3.5, 1:5
     """
+    # Determinar buffer y límites según activo
+    sym_upper = symbol.upper()
+    if "JPY" in sym_upper:
+        buffer_pct = 0.0015  # 0.15%
+        max_sl_pct = 0.02
+    elif sym_upper in ("XAUUSD", "XAGUSD", "USOIL", "UKOIL"):
+        buffer_pct = 0.003   # 0.3%
+        max_sl_pct = 0.04
+    else:
+        buffer_pct = 0.001   # 0.1%
+        max_sl_pct = 0.015
+
+    # Riesgo mínimo según activo
+    if sym_upper in ("XAUUSD", "XAGUSD", "USOIL", "UKOIL"):
+        min_risk_pct = 0.005  # 0.5% para commodities
+    else:
+        min_risk_pct = 0.002  # 0.2% para forex
+
     sl = None
 
     if df is not None:
@@ -779,9 +970,9 @@ def calc_sl_tp_fx(price, direction, support, resistance, df=None):
                         swing_highs.append(recent["high"].iloc[i])
                 highs_sobre_precio = [h for h in swing_highs if h > price]
                 if highs_sobre_precio:
-                    swing_h = max(highs_sobre_precio)
-                    sl_candidato = round(swing_h * 1.001, 6)
-                    if (sl_candidato - price) / price <= 0.02:
+                    swing_h      = max(highs_sobre_precio)
+                    sl_candidato = round(swing_h * (1 + buffer_pct), 6)
+                    if (sl_candidato - price) / price <= max_sl_pct:
                         sl = sl_candidato
             else:
                 recent = df.iloc[-50:]
@@ -794,36 +985,37 @@ def calc_sl_tp_fx(price, direction, support, resistance, df=None):
                         swing_lows.append(recent["low"].iloc[i])
                 lows_bajo_precio = [l for l in swing_lows if l < price]
                 if lows_bajo_precio:
-                    swing_l = min(lows_bajo_precio)
-                    sl_candidato = round(swing_l * 0.999, 6)
-                    if (price - sl_candidato) / price <= 0.02:
+                    swing_l      = min(lows_bajo_precio)
+                    sl_candidato = round(swing_l * (1 - buffer_pct), 6)
+                    if (price - sl_candidato) / price <= max_sl_pct:
                         sl = sl_candidato
-        except:
+        except Exception as e:
+            print("Error swing SL FX: " + str(e))
             sl = None
 
-    # Fallback — usar el máximo/mínimo de las últimas 10 velas + buffer
-    if sl is None:
-        if df is not None:
-            try:
-                if direction == "LONG":
-                    sl = round(df["low"].iloc[-10:].min() * 0.999, 6)
-                else:
-                    sl = round(df["high"].iloc[-10:].max() * 1.001, 6)
-            except:
-                sl = None
+    # Fallback — máximo/mínimo de las últimas 10 velas
+    if sl is None and df is not None:
+        try:
+            if direction == "LONG":
+                sl = round(df["low"].iloc[-10:].min() * (1 - buffer_pct), 6)
+            else:
+                sl = round(df["high"].iloc[-10:].max() * (1 + buffer_pct), 6)
+        except Exception as e:
+            print("Error fallback SL FX: " + str(e))
+            sl = None
 
     # Último fallback al S/R estático
     if sl is None:
         if direction == "LONG":
-            sl = round(support * 0.999, 6)
+            sl = round(support  * (1 - buffer_pct), 6)
         else:
-            sl = round(resistance * 1.001, 6)
+            sl = round(resistance * (1 + buffer_pct), 6)
 
     if direction == "LONG":
-        risk = max(price - sl, price * 0.002)
+        risk = max(price - sl, price * min_risk_pct)
         tp1, tp2, tp3 = round(price+risk*2.0, 6), round(price+risk*3.5, 6), round(price+risk*5.0, 6)
     else:
-        risk = max(sl - price, price * 0.002)
+        risk = max(sl - price, price * min_risk_pct)
         tp1, tp2, tp3 = round(price-risk*2.0, 6), round(price-risk*3.5, 6), round(price-risk*5.0, 6)
 
     return sl, tp1, tp2, tp3, round(abs(tp1-price)/risk, 1), round(abs(tp2-price)/risk, 1)
@@ -997,7 +1189,7 @@ def analyze_symbol_fx(symbol, symbol_yf, interval, tf_label):
             if ya_alerte_fx(symbol, direction, tf_label): continue
 
             # SL/TP
-            sl, tp1, tp2, tp3, rr1, rr2 = calc_sl_tp_fx(price, direction, sup, res, df)
+            sl, tp1, tp2, tp3, rr1, rr2 = calc_sl_tp_fx(price, direction, sup, res, df, symbol)
 
             results.append({
                 "symbol":      symbol,
@@ -1129,10 +1321,11 @@ if __name__ == "__main__":
         "— Domingo: desde 19:00 ART\n\n"
         "🔄 Escaneo cada 15 minutos\n"
         "⚙️ Score mínimo: " + str(MIN_SCORE) + "/10\n\n"
-        "💬 Comandos: /fxresumen | /fxscan | /fxayuda"
+        "💬 Comandos: /fxresumen | /fxscan | /fxreporte | /fxayuda"
     )
     scan_all_fx()
     schedule.every(15).minutes.do(scan_all_fx)
+    schedule.every(15).minutes.do(verificar_resultados_fx)
     schedule.every().day.at("08:00").do(resumen_diario_fx)
 
     last_update_id = None
