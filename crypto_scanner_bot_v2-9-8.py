@@ -86,7 +86,7 @@ def init_db():
                 tp2          FLOAT,
                 tp3          FLOAT,
                 confluencias TEXT,
-                enviada_at   TIMESTAMP DEFAULT NOW()
+                enviada_at   TIMESTAMPTZ DEFAULT NOW()
             )
         """)
         cur.execute("""
@@ -99,7 +99,7 @@ def init_db():
                 htf_bias       TEXT,
                 divergencia    TEXT,
                 precio         FLOAT,
-                actualizado_at TIMESTAMP DEFAULT NOW()
+                actualizado_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
         cur.execute("""
@@ -109,7 +109,7 @@ def init_db():
                 timeframe     VARCHAR(20),
                 rsi           FLOAT,
                 precio        FLOAT,
-                registrado_at TIMESTAMP DEFAULT NOW()
+                registrado_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
         cur.execute("""
@@ -129,8 +129,8 @@ def init_db():
                 tp_alcanzado  INTEGER DEFAULT 0,
                 precio_cierre FLOAT,
                 pnl_pct       FLOAT,
-                abierto_at    TIMESTAMP DEFAULT NOW(),
-                cerrado_at    TIMESTAMP
+                abierto_at    TIMESTAMPTZ DEFAULT NOW(),
+                cerrado_at    TIMESTAMPTZ
             )
         """)
         conn.commit()
@@ -223,13 +223,14 @@ def guardar_alerta(s, tf_label):
         alerta_id = cur.fetchone()[0]
         conn.commit()
 
-        # Crear registro de tracking solo si no hay ya uno OPEN del mismo par/dirección
+        # Crear registro de tracking solo si no hay ya uno OPEN del mismo par/dirección/timeframe
         cur.execute("""
             SELECT COUNT(*) FROM tracking
             WHERE symbol    = %s
               AND direction = %s
+              AND timeframe = %s
               AND resultado = 'OPEN'
-        """, (s["symbol"], s["direction"]))
+        """, (s["symbol"], s["direction"], tf_label))
         ya_open = cur.fetchone()[0] > 0
 
         if not ya_open:
@@ -315,7 +316,6 @@ def verificar_resultados():
                         pnl_pct   = round((entry - precio_actual) / entry * 100, 2)
 
                 # Expirar operaciones según timeframe
-                # 15m → 24hs | 1H → 5 días | 4H → 10 días
                 if resultado is None:
                     cur2 = conn.cursor()
                     cur2.execute("SELECT timeframe FROM tracking WHERE id = %s", (op_id,))
@@ -328,7 +328,14 @@ def verificar_resultados():
                     else:
                         max_horas = 120  # 1H → 5 días
 
-                    horas = (datetime.now(ARG_TZ) - abierto_at.replace(tzinfo=ARG_TZ)).total_seconds() / 3600
+                    # Zona horaria segura — abierto_at ya viene con TZ desde TIMESTAMPTZ
+                    now_tz = datetime.now(ARG_TZ)
+                    if abierto_at.tzinfo is None:
+                        abierto_tz = abierto_at.replace(tzinfo=ARG_TZ)
+                    else:
+                        abierto_tz = abierto_at
+                    horas = (now_tz - abierto_tz).total_seconds() / 3600
+
                     if horas > max_horas:
                         resultado     = "EXPIRED"
                         precio_cierre = precio_actual
@@ -514,18 +521,27 @@ def get_historial_alertas(limite=20):
 # =============================================================================
 
 def send_telegram(message):
-    """Envía mensaje a Telegram en chunks de 4000 caracteres con reintentos"""
+    """Envía mensaje a Telegram con reintentos y backoff dinámico para 429"""
     url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
     for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
-        try:
-            _session.post(
-                url,
-                json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
-                timeout=10
-            )
-            time.sleep(0.5)
-        except Exception as e:
-            print("Error Telegram: " + str(e))
+        for intento in range(4):
+            try:
+                r = _session.post(
+                    url,
+                    json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
+                    timeout=10
+                )
+                if r.status_code == 429:
+                    # Rate limit — esperar el tiempo que indica Telegram
+                    retry_after = r.json().get("parameters", {}).get("retry_after", 5)
+                    print("Telegram 429 — esperando " + str(retry_after) + "s")
+                    time.sleep(retry_after)
+                    continue
+                break  # éxito
+            except Exception as e:
+                print("Error Telegram intento " + str(intento+1) + ": " + str(e))
+                time.sleep(2 ** intento)  # backoff exponencial: 1s, 2s, 4s
+        time.sleep(0.5)
 
 
 def get_telegram_updates(offset=None):
@@ -641,6 +657,7 @@ def detect_rsi_divergence(df, period=14):
     Detecta divergencias de RSI.
     BULLISH_DIV: precio LL pero RSI HL → señal alcista.
     BEARISH_DIV: precio HH pero RSI LH → señal bajista.
+    Lookback dinámico y umbrales relajados para no perder divergencias en zonas extremas.
     """
     try:
         closes   = df["close"]
@@ -651,7 +668,8 @@ def detect_rsi_divergence(df, period=14):
         avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
         rsi_full = 100 - 100 / (1 + avg_gain / avg_loss)
 
-        lookback   = 100
+        # Lookback dinámico — mínimo 50, máximo 100 velas
+        lookback   = min(max(len(df) // 2, 50), 100)
         recent_df  = df.iloc[-lookback:]
         recent_rsi = rsi_full.iloc[-lookback:]
 
@@ -672,15 +690,16 @@ def detect_rsi_divergence(df, period=14):
                 rsi_lows.append((i, rh))
 
         divergence = None
+        # Umbral relajado a 45/55 para capturar divergencias en zonas extremas
         if (len(price_highs) >= 2 and
             price_highs[-1][1] > price_highs[-2][1] and
             rsi_highs[-1][1]  < rsi_highs[-2][1] and
-            rsi_highs[-1][1]  > 50):
+            rsi_highs[-1][1]  > 45):
             divergence = "BEARISH_DIV"
         if (len(price_lows) >= 2 and
             price_lows[-1][1] < price_lows[-2][1] and
             rsi_lows[-1][1]   > rsi_lows[-2][1] and
-            rsi_lows[-1][1]   < 50):
+            rsi_lows[-1][1]   < 55):
             divergence = "BULLISH_DIV"
         return divergence
     except:
@@ -720,33 +739,43 @@ def get_htf_bias(symbol, interval):
     """
     Sesgo del marco temporal mayor (HTF).
     Para 15m/1h usa 4H. Evalúa EMA50, EMA200 y estructura.
-    Retorna: BULLISH | BEARISH | NEUTRAL
+    Retorna NEUTRAL si no hay suficientes velas para calcular EMAs.
     """
     try:
         next_tf = "4h" if interval in ("15m", "1h") else "1d"
         df      = get_klines(symbol, next_tf, limit=250)
-        if df is None: return "NEUTRAL"
+        if df is None or len(df) < 60: return "NEUTRAL"  # mínimo 60 velas
+
         closes = df["close"]
         price  = closes.iloc[-1]
         ema50  = closes.ewm(span=50,  adjust=False, min_periods=50).mean().iloc[-1]
         ema200 = closes.ewm(span=200, adjust=False, min_periods=200).mean().iloc[-1]
-        if np.isnan(ema50) or np.isnan(ema200): return "NEUTRAL"
-        bull, bear = 0, 0
-        if price > ema50:  bull += 1
-        else:              bear += 1
-        if price > ema200: bull += 1
-        else:              bear += 1
-        if ema50 > ema200: bull += 1
-        else:              bear += 1
+
+        # Si no hay suficientes datos para EMA200, usar solo EMA50 y estructura
+        if np.isnan(ema200):
+            bull, bear = 0, 0
+            if not np.isnan(ema50):
+                if price > ema50: bull += 2
+                else:             bear += 2
+        else:
+            bull, bear = 0, 0
+            if price > ema50:  bull += 1
+            else:              bear += 1
+            if price > ema200: bull += 1
+            else:              bear += 1
+            if ema50 > ema200: bull += 1
+            else:              bear += 1
+
         highs, lows = [], []
         for i in range(2, len(df) - 2):
             if df["high"].iloc[i] > df["high"].iloc[i-1] and df["high"].iloc[i] > df["high"].iloc[i+1]:
                 highs.append(df["high"].iloc[i])
-            if df["low"].iloc[i]  < df["low"].iloc[i-1]  and df["low"].iloc[i]  < df["low"].iloc[i+1]:
+            if df["low"].iloc[i] < df["low"].iloc[i-1] and df["low"].iloc[i] < df["low"].iloc[i+1]:
                 lows.append(df["low"].iloc[i])
         if len(highs) >= 2 and len(lows) >= 2:
             if highs[-1] > highs[-2] and lows[-1] > lows[-2]:   bull += 2
             elif highs[-1] < highs[-2] and lows[-1] < lows[-2]: bear += 2
+
         if bull > bear:   return "BULLISH"
         elif bear > bull: return "BEARISH"
         return "NEUTRAL"
@@ -810,11 +839,15 @@ def calc_sr(df):
         sups = sorted([l for l in pl if l < price], reverse=True)
         ress = sorted([h for h in ph if h > price])
 
+        # Clustering dinámico según volatilidad del activo
+        vol_pct = ((df["high"] - df["low"]) / df["close"] * 100).iloc[-20:].mean()
+        cluster_threshold = max(vol_pct * 0.3, 0.2) / 100  # mínimo 0.2% para crypto
+
         def cluster(levels):
             if not levels: return levels
             clustered = [levels[0]]
             for l in levels[1:]:
-                if abs(l - clustered[-1]) / price > 0.003:
+                if abs(l - clustered[-1]) / price > cluster_threshold:
                     clustered.append(l)
             return clustered
 
@@ -830,13 +863,15 @@ def calc_sr(df):
 def detect_ob(df):
     """
     Order Blocks alcistas y bajistas. Busca el más reciente.
+    Solo considera OBs de las últimas 100 velas para asegurar vigencia.
     OB alcista: vela bajista + impulso alcista, precio dentro.
     OB bajista: vela alcista + impulso bajista, precio dentro.
     """
     ob_bull, ob_bear = None, None
     try:
-        price = df["close"].iloc[-1]
-        for i in range(min(len(df)-3, 200), 4, -1):
+        price    = df["close"].iloc[-1]
+        max_look = min(len(df)-3, 100)  # máx 100 velas para vigencia
+        for i in range(max_look, 4, -1):
             c     = df.iloc[i]
             body  = abs(c["close"] - c["open"])
             rng   = c["high"] - c["low"]

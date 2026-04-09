@@ -105,7 +105,7 @@ def init_db():
                 tp2          FLOAT,
                 tp3          FLOAT,
                 confluencias TEXT,
-                enviada_at   TIMESTAMP DEFAULT NOW()
+                enviada_at   TIMESTAMPTZ DEFAULT NOW()
             )
         """)
         cur.execute("""
@@ -118,7 +118,7 @@ def init_db():
                 htf_bias       TEXT,
                 divergencia    TEXT,
                 precio         FLOAT,
-                actualizado_at TIMESTAMP DEFAULT NOW(),
+                actualizado_at TIMESTAMPTZ DEFAULT NOW(),
                 CONSTRAINT fx_market_state_unique UNIQUE (symbol, timeframe)
             )
         """)
@@ -207,17 +207,26 @@ def get_historial_fx(limite=20):
 # =============================================================================
 
 def send_telegram(message):
+    """Envía mensaje a Telegram con reintentos y backoff dinámico para 429"""
     url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
     for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
-        try:
-            _session.post(
-                url,
-                json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
-                timeout=10
-            )
-            time.sleep(0.5)
-        except Exception as e:
-            print("Error Telegram: " + str(e))
+        for intento in range(4):
+            try:
+                r = _session.post(
+                    url,
+                    json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
+                    timeout=10
+                )
+                if r.status_code == 429:
+                    retry_after = r.json().get("parameters", {}).get("retry_after", 5)
+                    print("Telegram 429 — esperando " + str(retry_after) + "s")
+                    time.sleep(retry_after)
+                    continue
+                break
+            except Exception as e:
+                print("Error Telegram intento " + str(intento+1) + ": " + str(e))
+                time.sleep(2 ** intento)
+        time.sleep(0.5)
 
 
 def get_telegram_updates(offset=None):
@@ -303,24 +312,30 @@ def get_htf_bias_fx(symbol_yf):
     """
     Bias del timeframe diario (1D) para Forex.
     Usa EMA50, EMA200 y estructura de mercado.
+    Si no hay suficientes velas para EMA200, usa solo EMA50 y estructura.
     """
     try:
         df = get_klines_fx(symbol_yf, "1d", limit=250)
-        if df is None: return "NEUTRAL"
+        if df is None or len(df) < 60: return "NEUTRAL"
 
         closes = df["close"]
         price  = closes.iloc[-1]
         ema50  = closes.ewm(span=50,  adjust=False, min_periods=50).mean().iloc[-1]
         ema200 = closes.ewm(span=200, adjust=False, min_periods=200).mean().iloc[-1]
-        if np.isnan(ema50) or np.isnan(ema200): return "NEUTRAL"
 
-        bull, bear = 0, 0
-        if price > ema50:  bull += 1
-        else:              bear += 1
-        if price > ema200: bull += 1
-        else:              bear += 1
-        if ema50 > ema200: bull += 1
-        else:              bear += 1
+        if np.isnan(ema200):
+            bull, bear = 0, 0
+            if not np.isnan(ema50):
+                if price > ema50: bull += 2
+                else:             bear += 2
+        else:
+            bull, bear = 0, 0
+            if price > ema50:  bull += 1
+            else:              bear += 1
+            if price > ema200: bull += 1
+            else:              bear += 1
+            if ema50 > ema200: bull += 1
+            else:              bear += 1
 
         highs, lows = [], []
         for i in range(2, len(df) - 2):
@@ -434,8 +449,10 @@ def detect_rsi_divergence(df, period=14):
         avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
         rsi_full = 100 - 100 / (1 + avg_gain / avg_loss)
 
-        recent_df  = df.iloc[-100:]
-        recent_rsi = rsi_full.iloc[-100:]
+        # Lookback dinámico
+        lookback   = min(max(len(df) // 2, 50), 100)
+        recent_df  = df.iloc[-lookback:]
+        recent_rsi = rsi_full.iloc[-lookback:]
         price_highs, rsi_highs = [], []
         price_lows,  rsi_lows  = [], []
 
@@ -452,10 +469,10 @@ def detect_rsi_divergence(df, period=14):
 
         divergence = None
         if (len(price_highs) >= 2 and price_highs[-1][1] > price_highs[-2][1] and
-            rsi_highs[-1][1] < rsi_highs[-2][1] and rsi_highs[-1][1] > 50):
+            rsi_highs[-1][1] < rsi_highs[-2][1] and rsi_highs[-1][1] > 45):
             divergence = "BEARISH_DIV"
         if (len(price_lows) >= 2 and price_lows[-1][1] < price_lows[-2][1] and
-            rsi_lows[-1][1] > rsi_lows[-2][1] and rsi_lows[-1][1] < 50):
+            rsi_lows[-1][1] > rsi_lows[-2][1] and rsi_lows[-1][1] < 55):
             divergence = "BULLISH_DIV"
         return divergence
     except:
@@ -481,11 +498,15 @@ def calc_sr(df):
         sups = sorted([l for l in pl if l < price], reverse=True)
         ress = sorted([h for h in ph if h > price])
 
+        # Clustering dinámico según volatilidad del activo
+        vol_pct = ((df["high"] - df["low"]) / df["close"] * 100).iloc[-20:].mean()
+        cluster_threshold = max(vol_pct * 0.3, 0.1) / 100  # mínimo 0.1%
+
         def cluster(levels):
             if not levels: return levels
             clustered = [levels[0]]
             for l in levels[1:]:
-                if abs(l - clustered[-1]) / price > 0.003:
+                if abs(l - clustered[-1]) / price > cluster_threshold:
                     clustered.append(l)
             return clustered
 
@@ -499,10 +520,14 @@ def calc_sr(df):
 
 
 def detect_ob(df):
+    """
+    Order Blocks. Solo considera los últimos 100 velas para asegurar vigencia.
+    """
     ob_bull, ob_bear = None, None
     try:
-        price = df["close"].iloc[-1]
-        for i in range(min(len(df)-3, 200), 4, -1):
+        price    = df["close"].iloc[-1]
+        max_look = min(len(df)-3, 100)
+        for i in range(max_look, 4, -1):
             c     = df.iloc[i]
             body  = abs(c["close"] - c["open"])
             rng   = c["high"] - c["low"]
