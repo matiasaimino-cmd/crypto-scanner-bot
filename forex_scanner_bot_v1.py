@@ -30,7 +30,7 @@ CHAT_ID             = os.environ.get("TELEGRAM_CHAT_ID", "")
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("❌ Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en variables de entorno")
 
-MIN_SCORE           = 6
+MIN_SCORE           = 7
 RSI_OVERBOUGHT      = 70
 RSI_OVERSOLD        = 30
 RSI_EXTREME         = 75
@@ -776,6 +776,18 @@ def calc_sl_tp_fx(price, direction, support, resistance, df=None):
         except:
             sl = None
 
+    # Fallback — usar el máximo/mínimo de las últimas 10 velas + buffer
+    if sl is None:
+        if df is not None:
+            try:
+                if direction == "LONG":
+                    sl = round(df["low"].iloc[-10:].min() * 0.999, 6)
+                else:
+                    sl = round(df["high"].iloc[-10:].max() * 1.001, 6)
+            except:
+                sl = None
+
+    # Último fallback al S/R estático
     if sl is None:
         if direction == "LONG":
             sl = round(support * 0.999, 6)
@@ -784,10 +796,10 @@ def calc_sl_tp_fx(price, direction, support, resistance, df=None):
 
     if direction == "LONG":
         risk = max(price - sl, price * 0.002)
-        tp1, tp2, tp3 = round(price+risk*1.5, 6), round(price+risk*2.5, 6), round(price+risk*4.0, 6)
+        tp1, tp2, tp3 = round(price+risk*2.0, 6), round(price+risk*3.5, 6), round(price+risk*5.0, 6)
     else:
         risk = max(sl - price, price * 0.002)
-        tp1, tp2, tp3 = round(price-risk*1.5, 6), round(price-risk*2.5, 6), round(price-risk*4.0, 6)
+        tp1, tp2, tp3 = round(price-risk*2.0, 6), round(price-risk*3.5, 6), round(price-risk*5.0, 6)
 
     return sl, tp1, tp2, tp3, round(abs(tp1-price)/risk, 1), round(abs(tp2-price)/risk, 1)
 
@@ -904,11 +916,14 @@ def analyze_symbol_fx(symbol, symbol_yf, interval, tf_label):
             if direction == "SHORT" and rsi < 50 and rsi < RSI_EXTREME: continue
             if direction == "LONG"  and rsi > 50 and rsi > (100-RSI_EXTREME): continue
 
-            # 2. HTF Diario — no operar contra tendencia mayor
+            # 2. HTF Diario — OPCIÓN C: solo operar EN DIRECCIÓN del bias mayor
+            # HTF BAJISTA → solo SHORTs | HTF ALCISTA → solo LONGs
+            # NEUTRAL → ambas | RSI extremo → excepción
             rsi_extremo = (direction == "SHORT" and rsi >= RSI_EXTREME) or \
                           (direction == "LONG"  and rsi <= (100-RSI_EXTREME))
-            if direction == "SHORT" and htf_bias == "BULLISH" and not rsi_extremo: continue
-            if direction == "LONG"  and htf_bias == "BEARISH" and not rsi_extremo: continue
+            if not rsi_extremo:
+                if htf_bias == "BEARISH" and direction == "LONG":  continue
+                if htf_bias == "BULLISH" and direction == "SHORT": continue
 
             # 3. Score
             score, labels = calc_score(direction, rsi, ob, fvg, structure, candles, vol_h, near, divergence, htf_bias)

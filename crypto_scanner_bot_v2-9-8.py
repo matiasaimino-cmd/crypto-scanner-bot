@@ -30,7 +30,7 @@ BINANCE_BASE        = "https://api.binance.com/api/v3"
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("❌ Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en variables de entorno")
 
-MIN_SCORE           = 6
+MIN_SCORE           = 7
 RSI_OVERBOUGHT      = 70
 RSI_OVERSOLD        = 30
 RSI_EXTREME         = 75
@@ -1218,13 +1218,13 @@ def calc_sl_tp(price, direction, support, resistance, df=None):
         else:
             sl = round(resistance * 1.003, 6)
 
-    # Calcular riesgo y TPs
+    # Calcular riesgo y TPs — R:R mejorado: 1:2, 1:3.5, 1:5
     if direction == "LONG":
         risk = max(price - sl, price * 0.005)
-        tp1, tp2, tp3 = round(price+risk*1.5, 6), round(price+risk*2.5, 6), round(price+risk*4.0, 6)
+        tp1, tp2, tp3 = round(price+risk*2.0, 6), round(price+risk*3.5, 6), round(price+risk*5.0, 6)
     else:
         risk = max(sl - price, price * 0.005)
-        tp1, tp2, tp3 = round(price-risk*1.5, 6), round(price-risk*2.5, 6), round(price-risk*4.0, 6)
+        tp1, tp2, tp3 = round(price-risk*2.0, 6), round(price-risk*3.5, 6), round(price-risk*5.0, 6)
 
     return sl, tp1, tp2, tp3, round(abs(tp1-price)/risk, 1), round(abs(tp2-price)/risk, 1)
 
@@ -1363,11 +1363,15 @@ def analyze_symbol(symbol, interval):
             if direction == "SHORT" and rsi < 50 and rsi < RSI_EXTREME: continue
             if direction == "LONG"  and rsi > 50 and rsi > (100-RSI_EXTREME): continue
 
-            # 2. HTF 4H — no operar contra el bias mayor (salvo RSI extremo)
+            # 2. HTF 4H — OPCIÓN C: solo operar EN DIRECCIÓN del bias mayor
+            # HTF BAJISTA → solo SHORTs | HTF ALCISTA → solo LONGs
+            # Excepción: HTF NEUTRAL permite ambas direcciones
+            # Excepción: RSI extremo permite operar contra (agotamiento)
             rsi_extremo = (direction == "SHORT" and rsi >= RSI_EXTREME) or \
                           (direction == "LONG"  and rsi <= (100-RSI_EXTREME))
-            if direction == "SHORT" and htf_bias == "BULLISH" and not rsi_extremo: continue
-            if direction == "LONG"  and htf_bias == "BEARISH" and not rsi_extremo: continue
+            if not rsi_extremo:
+                if htf_bias == "BEARISH" and direction == "LONG":  continue
+                if htf_bias == "BULLISH" and direction == "SHORT": continue
 
             # 3. Filtro 1H intermedio (solo para trades de 15m)
             if bias_1h is not None and not rsi_extremo:
