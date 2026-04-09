@@ -30,6 +30,7 @@ CHAT_ID             = os.environ.get("TELEGRAM_CHAT_ID", "")
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("❌ Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en variables de entorno")
 
+MIN_SCORE_BASE      = 7
 MIN_SCORE           = 7
 RSI_OVERBOUGHT      = 70
 RSI_OVERSOLD        = 30
@@ -124,24 +125,26 @@ def init_db():
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS fx_tracking (
-                id            SERIAL PRIMARY KEY,
-                alerta_id     INTEGER,
-                symbol        VARCHAR(20),
-                direction     VARCHAR(10),
-                timeframe     VARCHAR(20),
-                precio_entry  FLOAT,
-                sl            FLOAT,
-                tp1           FLOAT,
-                tp2           FLOAT,
-                tp3           FLOAT,
-                score         FLOAT,
-                condicion     VARCHAR(20) DEFAULT 'TENDENCIA',
-                resultado     VARCHAR(10) DEFAULT 'OPEN',
-                tp_alcanzado  INTEGER DEFAULT 0,
-                precio_cierre FLOAT,
-                pnl_pct       FLOAT,
-                abierto_at    TIMESTAMPTZ DEFAULT NOW(),
-                cerrado_at    TIMESTAMPTZ
+                id             SERIAL PRIMARY KEY,
+                alerta_id      INTEGER,
+                symbol         VARCHAR(20),
+                direction      VARCHAR(10),
+                timeframe      VARCHAR(20),
+                precio_entry   FLOAT,
+                sl             FLOAT,
+                tp1            FLOAT,
+                tp2            FLOAT,
+                tp3            FLOAT,
+                score          FLOAT,
+                condicion      VARCHAR(20) DEFAULT 'TENDENCIA',
+                resultado      VARCHAR(10) DEFAULT 'OPEN',
+                tp_alcanzado   INTEGER DEFAULT 0,
+                precio_cierre  FLOAT,
+                pnl_pct        FLOAT,
+                cierre_parcial BOOLEAN DEFAULT FALSE,
+                pnl_parcial    FLOAT,
+                abierto_at     TIMESTAMPTZ DEFAULT NOW(),
+                cerrado_at     TIMESTAMPTZ
             )
         """)
         try:
@@ -228,20 +231,21 @@ def guardar_alerta_fx(s, tf_label):
 
 
 def verificar_resultados_fx():
-    """Verifica resultados de operaciones Forex abiertas, aplica trailing stop y notifica"""
+    """Verifica resultados de operaciones Forex abiertas, aplica trailing stop, cierre parcial y notifica"""
     conn = get_db()
     if not conn: return
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, symbol, direction, precio_entry, sl, tp1, tp2, tp3, abierto_at, timeframe
+            SELECT id, symbol, direction, precio_entry, sl, tp1, tp2, tp3,
+                   abierto_at, timeframe, cierre_parcial
             FROM fx_tracking WHERE resultado = 'OPEN'
         """)
         operaciones = cur.fetchall()
         if not operaciones: return
 
         for op in operaciones:
-            op_id, symbol, direction, entry, sl, tp1, tp2, tp3, abierto_at, tf = op
+            op_id, symbol, direction, entry, sl, tp1, tp2, tp3, abierto_at, tf, cierre_parcial = op
             try:
                 symbol_yf = SYMBOLS.get(symbol)
                 if not symbol_yf: continue
@@ -260,28 +264,62 @@ def verificar_resultados_fx():
                 except Exception as e:
                     print("Error trailing FX " + symbol + ": " + str(e))
 
+                # Cierre parcial en TP1 — 50% posicion, SL a breakeven
+                if not cierre_parcial:
+                    tp1_ok = (direction == "LONG"  and precio_actual >= tp1) or \
+                             (direction == "SHORT" and precio_actual <= tp1)
+                    if tp1_ok:
+                        try:
+                            pnl_50      = round(abs(tp1 - entry) / entry * 100, 4)
+                            nuevo_sl_be = round(entry * 1.001 if direction == "LONG" else entry * 0.999, 6)
+                            cur.execute("""
+                                UPDATE fx_tracking
+                                SET cierre_parcial = TRUE, pnl_parcial = %s, sl = %s
+                                WHERE id = %s
+                            """, (pnl_50, nuevo_sl_be, op_id))
+                            conn.commit()
+                            sl             = nuevo_sl_be
+                            cierre_parcial = True
+                            emoji2 = "\U0001f7e2" if direction == "LONG" else "\U0001f534"
+                            msg_cp  = "\U0001f514 <b>CIERRE PARCIAL 50%</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
+                            msg_cp += "\U0001f3af TP1 @ " + fmt_fx(tp1) + "\n"
+                            msg_cp += "\U0001f4b0 P&L 50%: <b>+" + str(pnl_50) + "%</b>\n"
+                            msg_cp += "\U0001f504 SL breakeven: " + fmt_fx(nuevo_sl_be) + "\n"
+                            msg_cp += "\u23f3 50% restante apunta a TP2/TP3"
+                            send_telegram(msg_cp)
+                        except Exception as e:
+                            print("Error cierre parcial FX " + symbol + ": " + str(e))
+
                 resultado = None; tp_alcanzado = 0; pnl_pct = 0.0
 
                 if direction == "LONG":
                     if precio_actual <= sl:
-                        resultado = "LOSS"; pnl_pct = round((precio_actual - entry) / entry * 100, 2)
+                        resultado    = "WIN" if cierre_parcial else "LOSS"
+                        tp_alcanzado = 1 if cierre_parcial else 0
+                        pnl_pct      = round((precio_actual - entry) / entry * 100, 4)
                     elif precio_actual >= tp3:
-                        resultado = "WIN"; tp_alcanzado = 3; pnl_pct = round((precio_actual - entry) / entry * 100, 2)
+                        resultado = "WIN"; tp_alcanzado = 3
+                        pnl_pct   = round((precio_actual - entry) / entry * 100, 4)
                     elif precio_actual >= tp2:
-                        resultado = "WIN"; tp_alcanzado = 2; pnl_pct = round((precio_actual - entry) / entry * 100, 2)
-                    elif precio_actual >= tp1:
-                        resultado = "WIN"; tp_alcanzado = 1; pnl_pct = round((precio_actual - entry) / entry * 100, 2)
+                        resultado = "WIN"; tp_alcanzado = 2
+                        pnl_pct   = round((precio_actual - entry) / entry * 100, 4)
+                    elif precio_actual >= tp1 and cierre_parcial:
+                        pass
                 else:
                     if precio_actual >= sl:
-                        resultado = "LOSS"; pnl_pct = round((entry - precio_actual) / entry * 100, 2)
+                        resultado    = "WIN" if cierre_parcial else "LOSS"
+                        tp_alcanzado = 1 if cierre_parcial else 0
+                        pnl_pct      = round((entry - precio_actual) / entry * 100, 4)
                     elif precio_actual <= tp3:
-                        resultado = "WIN"; tp_alcanzado = 3; pnl_pct = round((entry - precio_actual) / entry * 100, 2)
+                        resultado = "WIN"; tp_alcanzado = 3
+                        pnl_pct   = round((entry - precio_actual) / entry * 100, 4)
                     elif precio_actual <= tp2:
-                        resultado = "WIN"; tp_alcanzado = 2; pnl_pct = round((entry - precio_actual) / entry * 100, 2)
-                    elif precio_actual <= tp1:
-                        resultado = "WIN"; tp_alcanzado = 1; pnl_pct = round((entry - precio_actual) / entry * 100, 2)
+                        resultado = "WIN"; tp_alcanzado = 2
+                        pnl_pct   = round((entry - precio_actual) / entry * 100, 4)
+                    elif precio_actual <= tp1 and cierre_parcial:
+                        pass
 
-                # Expirar según timeframe
+                # Expirar segun timeframe
                 if resultado is None:
                     now_tz     = datetime.now(ARG_TZ)
                     abierto_tz = abierto_at if abierto_at.tzinfo else abierto_at.replace(tzinfo=ARG_TZ)
@@ -289,7 +327,7 @@ def verificar_resultados_fx():
                     max_horas  = 120 if "4H" in tf else 24
                     if horas > max_horas:
                         resultado = "EXPIRED"
-                        pnl_pct   = round((entry - precio_actual) / entry * 100 * (-1 if direction == "LONG" else 1), 2)
+                        pnl_pct   = round((entry - precio_actual) / entry * 100 * (-1 if direction == "LONG" else 1), 4)
 
                 if resultado:
                     cur.execute("""
@@ -298,13 +336,13 @@ def verificar_resultados_fx():
                     """, (resultado, tp_alcanzado, precio_actual, pnl_pct, op_id))
                     conn.commit()
                     if resultado in ("WIN", "LOSS"):
-                        emoji  = "✅" if resultado == "WIN" else "❌"
-                        emoji2 = "🟢" if direction == "LONG" else "🔴"
+                        emoji  = "\u2705" if resultado == "WIN" else "\u274c"
+                        emoji2 = "\U0001f7e2" if direction == "LONG" else "\U0001f534"
                         msg    = emoji + " <b>" + resultado + "</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
-                        if resultado == "WIN": msg += "🎯 TP" + str(tp_alcanzado) + " alcanzado\n"
-                        else:                  msg += "🛑 SL tocado\n"
-                        msg += "📊 Entrada: " + fmt_fx(entry) + " → " + fmt_fx(precio_actual) + "\n"
-                        msg += "💰 P&L: <b>" + ("+" if pnl_pct > 0 else "") + str(pnl_pct) + "%</b>"
+                        if resultado == "WIN": msg += "\U0001f3af TP" + str(tp_alcanzado) + " alcanzado\n"
+                        else:                  msg += "\U0001f6d1 SL tocado\n"
+                        msg += "\U0001f4ca Entrada: " + fmt_fx(entry) + " \u2192 " + fmt_fx(precio_actual) + "\n"
+                        msg += "\U0001f4b0 P&L: <b>" + ("+" if pnl_pct > 0 else "") + str(pnl_pct) + "%</b>"
                         send_telegram(msg)
             except Exception as e:
                 print("Error verificar FX " + symbol + ": " + str(e))
@@ -312,7 +350,6 @@ def verificar_resultados_fx():
         print("Error verificar_resultados_fx: " + str(e))
     finally:
         conn.close()
-
 
 def reporte_tracking_fx():
     """Reporte de rendimiento del bot Forex — comando /fxreporte"""
@@ -487,6 +524,42 @@ def get_klines_fx(symbol_yf, interval, limit=200):
     except Exception as e:
         print("Error get_klines_fx: " + str(e))
         return None
+
+
+def get_min_score_adaptativo():
+    """
+    Score mínimo dinámico para Forex según condición del mercado.
+    Usa EURUSD como barómetro (par más líquido y representativo).
+
+    - Alta volatilidad (ATR > 1%) → score 8
+    - Mercado en rango (sin direccionalidad) → score 8
+    - Tendencia clara → score base 7
+    """
+    global MIN_SCORE
+    try:
+        df_eur = get_klines_fx("EURUSD=X", "1h", limit=30)
+        if df_eur is None:
+            MIN_SCORE = MIN_SCORE_BASE
+            return MIN_SCORE
+
+        atr_eur     = calc_atr(df_eur)
+        direccional = tiene_direccionalidad(df_eur)
+
+        if atr_eur > 1.0:
+            MIN_SCORE = min(MIN_SCORE_BASE + 1, 9)
+            print("FX Score adaptativo: " + str(MIN_SCORE) + " (alta volatilidad EURUSD ATR=" + str(atr_eur) + "%)")
+        elif not direccional:
+            MIN_SCORE = min(MIN_SCORE_BASE + 1, 9)
+            print("FX Score adaptativo: " + str(MIN_SCORE) + " (EURUSD en rango)")
+        else:
+            MIN_SCORE = MIN_SCORE_BASE
+            print("FX Score adaptativo: " + str(MIN_SCORE) + " (tendencia clara)")
+
+        return MIN_SCORE
+    except Exception as e:
+        print("Error score adaptativo FX: " + str(e))
+        MIN_SCORE = MIN_SCORE_BASE
+        return MIN_SCORE
 
 
 def get_htf_bias_fx(symbol_yf):
@@ -1333,6 +1406,9 @@ def scan_all_fx():
         hora = datetime.now(ARG_TZ).strftime("%H:%M")
         print("[" + hora + "] Fuera de sesión — sin escaneo")
         return
+
+    # Actualizar score mínimo según condición del mercado
+    get_min_score_adaptativo()
 
     now = datetime.now(ARG_TZ).strftime("%H:%M")
     ts  = datetime.now(ARG_TZ).strftime("%d/%m %H:%M:%S")

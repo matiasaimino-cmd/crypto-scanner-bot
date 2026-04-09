@@ -30,7 +30,8 @@ BINANCE_BASE        = "https://api.binance.com/api/v3"
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("❌ Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en variables de entorno")
 
-MIN_SCORE           = 7
+MIN_SCORE_BASE      = 7   # Score mínimo base — se ajusta dinámicamente
+MIN_SCORE           = 7   # Score activo — actualizado por get_min_score_adaptativo()
 RSI_OVERBOUGHT      = 70
 RSI_OVERSOLD        = 30
 RSI_EXTREME         = 75
@@ -114,24 +115,26 @@ def init_db():
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS tracking (
-                id            SERIAL PRIMARY KEY,
-                alerta_id     INTEGER,
-                symbol        VARCHAR(20),
-                direction     VARCHAR(10),
-                timeframe     VARCHAR(20),
-                precio_entry  FLOAT,
-                sl            FLOAT,
-                tp1           FLOAT,
-                tp2           FLOAT,
-                tp3           FLOAT,
-                score         FLOAT,
-                condicion     VARCHAR(20) DEFAULT 'TENDENCIA',
-                resultado     VARCHAR(10) DEFAULT 'OPEN',
-                tp_alcanzado  INTEGER DEFAULT 0,
-                precio_cierre FLOAT,
-                pnl_pct       FLOAT,
-                abierto_at    TIMESTAMPTZ DEFAULT NOW(),
-                cerrado_at    TIMESTAMPTZ
+                id             SERIAL PRIMARY KEY,
+                alerta_id      INTEGER,
+                symbol         VARCHAR(20),
+                direction      VARCHAR(10),
+                timeframe      VARCHAR(20),
+                precio_entry   FLOAT,
+                sl             FLOAT,
+                tp1            FLOAT,
+                tp2            FLOAT,
+                tp3            FLOAT,
+                score          FLOAT,
+                condicion      VARCHAR(20) DEFAULT 'TENDENCIA',
+                resultado      VARCHAR(10) DEFAULT 'OPEN',
+                tp_alcanzado   INTEGER DEFAULT 0,
+                precio_cierre  FLOAT,
+                pnl_pct        FLOAT,
+                cierre_parcial BOOLEAN DEFAULT FALSE,
+                pnl_parcial    FLOAT,
+                abierto_at     TIMESTAMPTZ DEFAULT NOW(),
+                cerrado_at     TIMESTAMPTZ
             )
         """)
         conn.commit()
@@ -266,7 +269,8 @@ def verificar_resultados():
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, symbol, direction, precio_entry, sl, tp1, tp2, tp3, abierto_at
+            SELECT id, symbol, direction, precio_entry, sl, tp1, tp2, tp3, abierto_at,
+                   cierre_parcial
             FROM tracking
             WHERE resultado = 'OPEN'
         """)
@@ -274,7 +278,7 @@ def verificar_resultados():
         if not operaciones: return
 
         for op in operaciones:
-            op_id, symbol, direction, entry, sl, tp1, tp2, tp3, abierto_at = op
+            op_id, symbol, direction, entry, sl, tp1, tp2, tp3, abierto_at, cierre_parcial = op
             try:
                 # Obtener precio actual de Binance
                 r = _session.get(
@@ -301,9 +305,49 @@ def verificar_resultados():
                 except Exception as e:
                     print("Error trailing stop " + symbol + ": " + str(e))
 
+                # ── CIERRE PARCIAL EN TP1 ────────────────────────────────────
+                # Cuando el precio llega a TP1 por primera vez:
+                # - Se registra el cierre del 50% de la posición
+                # - SL se mueve a breakeven (entrada + pequeño buffer)
+                # - La operación sigue abierta apuntando a TP2/TP3
+                if not cierre_parcial:
+                    tp1_alcanzado = (direction == "LONG"  and precio_actual >= tp1) or \
+                                    (direction == "SHORT" and precio_actual <= tp1)
+                    if tp1_alcanzado:
+                        try:
+                            pnl_50 = round(abs(tp1 - entry) / entry * 100, 2)
+                            # SL a breakeven + pequeño buffer del 0.1%
+                            if direction == "LONG":
+                                nuevo_sl_be = round(entry * 1.001, 6)
+                            else:
+                                nuevo_sl_be = round(entry * 0.999, 6)
+                            cur.execute("""
+                                UPDATE tracking
+                                SET cierre_parcial = TRUE,
+                                    pnl_parcial    = %s,
+                                    sl             = %s
+                                WHERE id = %s
+                            """, (pnl_50, nuevo_sl_be, op_id))
+                            conn.commit()
+                            sl             = nuevo_sl_be
+                            cierre_parcial = True
+
+                            # Notificar cierre parcial
+                            emoji2 = "🟢" if direction == "LONG" else "🔴"
+                            msg_cp  = "🔔 <b>CIERRE PARCIAL 50%</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
+                            msg_cp += "🎯 TP1 alcanzado @ " + fmt(tp1) + "\n"
+                            msg_cp += "💰 P&L 50%: <b>+" + str(pnl_50) + "%</b>\n"
+                            msg_cp += "🔄 SL movido a breakeven: " + fmt(nuevo_sl_be) + "\n"
+                            msg_cp += "⏳ 50% restante apunta a TP2/TP3"
+                            send_telegram(msg_cp)
+                            print("Cierre parcial: " + symbol + " TP1 +" + str(pnl_50) + "%")
+                        except Exception as e:
+                            print("Error cierre parcial " + symbol + ": " + str(e))
+
                 if direction == "LONG":
                     if precio_actual <= sl:
-                        resultado = "LOSS"
+                        resultado = "LOSS" if not cierre_parcial else "WIN"
+                        tp_alcanzado = 1 if cierre_parcial else 0
                         pnl_pct   = round((precio_actual - entry) / entry * 100, 2)
                     elif precio_actual >= tp3:
                         resultado = "WIN"; tp_alcanzado = 3
@@ -311,12 +355,12 @@ def verificar_resultados():
                     elif precio_actual >= tp2:
                         resultado = "WIN"; tp_alcanzado = 2
                         pnl_pct   = round((precio_actual - entry) / entry * 100, 2)
-                    elif precio_actual >= tp1:
-                        resultado = "WIN"; tp_alcanzado = 1
-                        pnl_pct   = round((precio_actual - entry) / entry * 100, 2)
+                    elif precio_actual >= tp1 and cierre_parcial:
+                        pass  # ya se hizo cierre parcial — seguir esperando TP2/TP3
                 else:  # SHORT
                     if precio_actual >= sl:
-                        resultado = "LOSS"
+                        resultado = "LOSS" if not cierre_parcial else "WIN"
+                        tp_alcanzado = 1 if cierre_parcial else 0
                         pnl_pct   = round((entry - precio_actual) / entry * 100, 2)
                     elif precio_actual <= tp3:
                         resultado = "WIN"; tp_alcanzado = 3
@@ -324,9 +368,8 @@ def verificar_resultados():
                     elif precio_actual <= tp2:
                         resultado = "WIN"; tp_alcanzado = 2
                         pnl_pct   = round((entry - precio_actual) / entry * 100, 2)
-                    elif precio_actual <= tp1:
-                        resultado = "WIN"; tp_alcanzado = 1
-                        pnl_pct   = round((entry - precio_actual) / entry * 100, 2)
+                    elif precio_actual <= tp1 and cierre_parcial:
+                        pass  # ya se hizo cierre parcial — seguir esperando TP2/TP3
 
                 # Expirar operaciones según timeframe
                 if resultado is None:
@@ -428,6 +471,14 @@ def reporte_tracking():
         """)
         por_condicion = cur.fetchall()
 
+        # Cierres parciales
+        cur.execute("""
+            SELECT COUNT(*), AVG(pnl_parcial)
+            FROM tracking
+            WHERE cierre_parcial = TRUE AND resultado != 'OPEN'
+        """)
+        parciales = cur.fetchone()
+
         if not stats:
             send_telegram("📊 Sin operaciones cerradas todavía.")
             return
@@ -444,6 +495,13 @@ def reporte_tracking():
         msg += "❌ Perdedoras: <b>" + str(losses[1]) + "</b>\n"
         if wins[2]:   msg += "💰 P&L prom WIN:  <b>+" + str(round(wins[2], 2)) + "%</b>\n"
         if losses[2]: msg += "💸 P&L prom LOSS: <b>" + str(round(losses[2], 2)) + "%</b>\n"
+
+        # Cierres parciales
+        if parciales and parciales[0] and parciales[0] > 0:
+            msg += "🔔 Cierres parciales TP1: <b>" + str(parciales[0]) + "</b>"
+            if parciales[1]:
+                msg += " (prom +" + str(round(parciales[1], 2)) + "%)"
+            msg += "\n"
 
         # Análisis por condición de mercado
         if por_condicion:
@@ -759,6 +817,50 @@ def get_btc_momentum(interval):
         return "NEUTRAL"
     except:
         return "NEUTRAL"
+
+
+def get_min_score_adaptativo():
+    """
+    Score mínimo dinámico según condición del mercado (BTC).
+
+    Lógica:
+    - Mercado en ALTA VOLATILIDAD (ATR BTC > 3%) → subir score a 8
+      Razón: en días de alta volatilidad hay más señales falsas
+    - Mercado en TENDENCIA CLARA (BTC direccional) → mantener score base 7
+      Razón: las señales en tendencia son más confiables
+    - Mercado en RANGO (BTC sin direccionalidad) → subir score a 8
+      Razón: en rango hay más ruido y menos seguimiento de señales
+
+    Actualiza la variable global MIN_SCORE.
+    """
+    global MIN_SCORE
+    try:
+        df_btc = get_klines("BTCUSDT", "1h", limit=30)
+        if df_btc is None:
+            MIN_SCORE = MIN_SCORE_BASE
+            return MIN_SCORE
+
+        atr_btc      = calc_atr(df_btc)
+        direccional  = tiene_direccionalidad(df_btc)
+
+        if atr_btc > 3.0:
+            # Alta volatilidad — mercado impredecible
+            MIN_SCORE = min(MIN_SCORE_BASE + 1, 9)
+            print("Score adaptativo: " + str(MIN_SCORE) + " (alta volatilidad BTC ATR=" + str(atr_btc) + "%)")
+        elif not direccional:
+            # BTC en rango — más ruido
+            MIN_SCORE = min(MIN_SCORE_BASE + 1, 9)
+            print("Score adaptativo: " + str(MIN_SCORE) + " (BTC en rango)")
+        else:
+            # Tendencia clara — score normal
+            MIN_SCORE = MIN_SCORE_BASE
+            print("Score adaptativo: " + str(MIN_SCORE) + " (tendencia clara)")
+
+        return MIN_SCORE
+    except Exception as e:
+        print("Error score adaptativo: " + str(e))
+        MIN_SCORE = MIN_SCORE_BASE
+        return MIN_SCORE
 
 
 def get_htf_bias(symbol, interval):
@@ -1673,6 +1775,9 @@ def scan_all():
     now = datetime.now(ARG_TZ).strftime("%H:%M")
     ts  = datetime.now(ARG_TZ).strftime("%d/%m %H:%M:%S")
     print("[" + now + "] Escaneando...")
+
+    # Actualizar score mínimo según condición del mercado
+    get_min_score_adaptativo()
 
     all_setups = []
     for interval, tf_label in INTERVALS:
