@@ -1844,14 +1844,14 @@ def scan_all():
             for s in shorts:
                 guardar_alerta(s, s["tf_label"])
                 msg += format_setup(s, s["tf_label"]) + "\n"
+
+        msg += "\n🕐 " + ts
+        msg += "\n⚠️ No es consejo financiero."
+        send_telegram(msg)
+        print("[" + now + "] Señales enviadas — " + str(len(all_setups)) + " setups")
     else:
-        msg += "\n⏳ Sin setups ahora.\n"
-
-    msg += "\n🕐 " + ts
-    msg += "\n⚠️ No es consejo financiero."
-
-    send_telegram(msg)
-    print("[" + now + "] Alerta enviada — " + str(len(all_setups)) + " setups")
+        # Sin señales — no enviar nada, solo log interno
+        print("[" + now + "] Sin setups — sin mensaje")
 
 # =============================================================================
 #   RESUMEN DIARIO

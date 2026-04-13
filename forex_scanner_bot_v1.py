@@ -1448,13 +1448,14 @@ def scan_all_fx():
             for s in shorts:
                 guardar_alerta_fx(s, s["tf_label"])
                 msg += format_setup_fx(s, s["tf_label"]) + "\n"
-    else:
-        msg += "\n⏳ Sin setups ahora.\n"
 
-    msg += "\n🕐 " + ts
-    msg += "\n⚠️ No es consejo financiero."
-    send_telegram(msg)
-    print("[" + now + "] FX scan completado — " + str(len(all_setups)) + " setups")
+        msg += "\n🕐 " + ts
+        msg += "\n⚠️ No es consejo financiero."
+        send_telegram(msg)
+        print("[" + now + "] FX señales enviadas — " + str(len(all_setups)) + " setups")
+    else:
+        # Sin señales — silencio total, solo log interno
+        print("[" + now + "] FX sin setups — sin mensaje")
 
 # =============================================================================
 #   RESUMEN DIARIO
