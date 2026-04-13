@@ -176,6 +176,21 @@ def init_db():
             conn.commit()
         except:
             conn.rollback()
+
+        # Agregar columnas nuevas a tracking si no existen — migración automática
+        migraciones = [
+            "ALTER TABLE tracking ADD COLUMN IF NOT EXISTS condicion      VARCHAR(20) DEFAULT 'TENDENCIA'",
+            "ALTER TABLE tracking ADD COLUMN IF NOT EXISTS cierre_parcial BOOLEAN     DEFAULT FALSE",
+            "ALTER TABLE tracking ADD COLUMN IF NOT EXISTS pnl_parcial    FLOAT",
+        ]
+        for sql in migraciones:
+            try:
+                cur.execute(sql)
+                conn.commit()
+            except Exception as e:
+                print("Migración tracking: " + str(e))
+                conn.rollback()
+
         print("DB iniciada OK")
     except Exception as e:
         print("Error init DB: " + str(e))
@@ -440,14 +455,21 @@ def verificar_resultados():
 
 def reporte_tracking():
     """
-    Genera reporte de rendimiento con todas las operaciones cerradas.
-    Incluye análisis por condición de mercado (TENDENCIA/RANGO/ALTA_VOLATILIDAD).
-    Comando: /reporte
+    Genera reporte de rendimiento. Comando: /reporte
+    Siempre responde algo — nunca silencio.
     """
     conn = get_db()
-    if not conn: return
+    if not conn:
+        send_telegram("❌ Error: no se pudo conectar a la base de datos.")
+        return
     try:
         cur = conn.cursor()
+
+        # Operaciones abiertas
+        cur.execute("SELECT COUNT(*) FROM tracking WHERE resultado = 'OPEN'")
+        abiertas = cur.fetchone()[0]
+
+        # Stats de cerradas
         cur.execute("""
             SELECT resultado, COUNT(*), AVG(pnl_pct), MAX(pnl_pct), MIN(pnl_pct)
             FROM tracking WHERE resultado != 'OPEN' GROUP BY resultado
@@ -461,26 +483,41 @@ def reporte_tracking():
         """)
         ultimas = cur.fetchall()
 
-        # Por condición de mercado
-        cur.execute("""
-            SELECT condicion,
-                   COUNT(*) FILTER (WHERE resultado = 'WIN') as wins,
-                   COUNT(*) FILTER (WHERE resultado = 'LOSS') as losses
-            FROM tracking WHERE resultado != 'OPEN'
-            GROUP BY condicion
-        """)
-        por_condicion = cur.fetchall()
+        # Por condición de mercado — con fallback si columna no existe
+        por_condicion = []
+        try:
+            cur.execute("""
+                SELECT condicion,
+                       COUNT(*) FILTER (WHERE resultado = 'WIN') as wins,
+                       COUNT(*) FILTER (WHERE resultado = 'LOSS') as losses
+                FROM tracking WHERE resultado != 'OPEN'
+                GROUP BY condicion
+            """)
+            por_condicion = cur.fetchall()
+        except Exception as e:
+            print("Error condicion: " + str(e))
+            conn.rollback()
 
-        # Cierres parciales
-        cur.execute("""
-            SELECT COUNT(*), AVG(pnl_parcial)
-            FROM tracking
-            WHERE cierre_parcial = TRUE AND resultado != 'OPEN'
-        """)
-        parciales = cur.fetchone()
+        # Cierres parciales — con fallback
+        parciales = None
+        try:
+            cur.execute("""
+                SELECT COUNT(*), AVG(pnl_parcial)
+                FROM tracking WHERE cierre_parcial = TRUE AND resultado != 'OPEN'
+            """)
+            parciales = cur.fetchone()
+        except Exception as e:
+            print("Error parciales: " + str(e))
+            conn.rollback()
+
+        msg  = "📊 <b>REPORTE DE RENDIMIENTO</b>\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "🔄 Operaciones abiertas: <b>" + str(abiertas) + "</b>\n"
 
         if not stats:
-            send_telegram("📊 Sin operaciones cerradas todavía.")
+            msg += "\n⏳ Sin operaciones cerradas todavía.\n"
+            msg += "El bot está trackeando — las notificaciones llegarán cuando se cierren."
+            send_telegram(msg)
             return
 
         wins     = next((r for r in stats if r[0] == "WIN"),  (None, 0, 0, 0, 0))
@@ -488,8 +525,6 @@ def reporte_tracking():
         total    = sum(r[1] for r in stats if r[0] in ("WIN", "LOSS"))
         win_rate = round(wins[1] / total * 100, 1) if total > 0 else 0
 
-        msg  = "📊 <b>REPORTE DE RENDIMIENTO</b>\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━\n"
         msg += "Total operaciones: <b>" + str(total) + "</b>\n"
         msg += "✅ Ganadoras: <b>" + str(wins[1]) + "</b> (" + str(win_rate) + "%)\n"
         msg += "❌ Perdedoras: <b>" + str(losses[1]) + "</b>\n"
