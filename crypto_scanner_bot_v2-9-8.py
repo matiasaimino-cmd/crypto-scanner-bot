@@ -346,14 +346,16 @@ def verificar_resultados():
                             conn.commit()
                             sl             = nuevo_sl_be
                             cierre_parcial = True
+                            ts_now = datetime.now(ARG_TZ).strftime("%d/%m %H:%M")
 
                             # Notificar cierre parcial
-                            emoji2 = "🟢" if direction == "LONG" else "🔴"
+                            emoji2  = "🟢" if direction == "LONG" else "🔴"
                             msg_cp  = "🔔 <b>CIERRE PARCIAL 50%</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
                             msg_cp += "🎯 TP1 alcanzado @ " + fmt(tp1) + "\n"
                             msg_cp += "💰 P&L 50%: <b>+" + str(pnl_50) + "%</b>\n"
                             msg_cp += "🔄 SL movido a breakeven: " + fmt(nuevo_sl_be) + "\n"
-                            msg_cp += "⏳ 50% restante apunta a TP2/TP3"
+                            msg_cp += "⏳ 50% restante apunta a TP2/TP3\n"
+                            msg_cp += "🕐 " + ts_now
                             send_telegram(msg_cp)
                             print("Cierre parcial: " + symbol + " TP1 +" + str(pnl_50) + "%")
                         except Exception as e:
@@ -361,9 +363,15 @@ def verificar_resultados():
 
                 if direction == "LONG":
                     if precio_actual <= sl:
-                        resultado = "LOSS" if not cierre_parcial else "WIN"
+                        resultado    = "LOSS" if not cierre_parcial else "WIN"
                         tp_alcanzado = 1 if cierre_parcial else 0
-                        pnl_pct   = round((precio_actual - entry) / entry * 100, 2)
+                        if cierre_parcial:
+                            # Promedio ponderado: 50% cerrado en TP1 + 50% cerrado ahora
+                            pnl_tp1  = round((tp1 - entry) / entry * 100, 2)
+                            pnl_rest = round((precio_actual - entry) / entry * 100, 2)
+                            pnl_pct  = round((pnl_tp1 + pnl_rest) / 2, 2)
+                        else:
+                            pnl_pct = round((precio_actual - entry) / entry * 100, 2)
                     elif precio_actual >= tp3:
                         resultado = "WIN"; tp_alcanzado = 3
                         pnl_pct   = round((precio_actual - entry) / entry * 100, 2)
@@ -374,9 +382,14 @@ def verificar_resultados():
                         pass  # ya se hizo cierre parcial — seguir esperando TP2/TP3
                 else:  # SHORT
                     if precio_actual >= sl:
-                        resultado = "LOSS" if not cierre_parcial else "WIN"
+                        resultado    = "LOSS" if not cierre_parcial else "WIN"
                         tp_alcanzado = 1 if cierre_parcial else 0
-                        pnl_pct   = round((entry - precio_actual) / entry * 100, 2)
+                        if cierre_parcial:
+                            pnl_tp1  = round((entry - tp1) / entry * 100, 2)
+                            pnl_rest = round((entry - precio_actual) / entry * 100, 2)
+                            pnl_pct  = round((pnl_tp1 + pnl_rest) / 2, 2)
+                        else:
+                            pnl_pct = round((entry - precio_actual) / entry * 100, 2)
                     elif precio_actual <= tp3:
                         resultado = "WIN"; tp_alcanzado = 3
                         pnl_pct   = round((entry - precio_actual) / entry * 100, 2)
@@ -431,6 +444,7 @@ def verificar_resultados():
                     # Notificar por Telegram si es WIN o LOSS
                     # Evitar duplicados del mismo símbolo en el mismo ciclo
                     if resultado in ("WIN", "LOSS"):
+                        ts_now = datetime.now(ARG_TZ).strftime("%d/%m %H:%M")
                         emoji  = "✅" if resultado == "WIN" else "❌"
                         emoji2 = "🟢" if direction == "LONG" else "🔴"
                         msg    = emoji + " <b>" + resultado + "</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
@@ -439,7 +453,13 @@ def verificar_resultados():
                         else:
                             msg += "🛑 SL tocado\n"
                         msg += "📊 Entrada: " + fmt(entry) + " → " + fmt(precio_cierre) + "\n"
-                        msg += "💰 P&L: <b>" + ("+" if pnl_pct > 0 else "") + str(pnl_pct) + "%</b>"
+                        if cierre_parcial and tp_alcanzado == 1:
+                            pnl_tp1_show = round(abs(tp1 - entry) / entry * 100, 2)
+                            pnl_sl_show  = round(abs(precio_cierre - entry) / entry * 100, 2)
+                            msg += "📈 50% en TP1: +" + str(pnl_tp1_show) + "%\n"
+                            msg += "📉 50% en breakeven: " + ("+" if precio_cierre >= entry else "-") + str(pnl_sl_show) + "%\n"
+                        msg += "💰 P&L total: <b>" + ("+" if pnl_pct > 0 else "") + str(pnl_pct) + "%</b>\n"
+                        msg += "🕐 " + ts_now
                         send_telegram(msg)
                         print("Tracking: " + resultado + " " + symbol + " " + str(pnl_pct) + "%")
 

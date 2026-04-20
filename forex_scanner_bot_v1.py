@@ -280,12 +280,14 @@ def verificar_resultados_fx():
                             conn.commit()
                             sl             = nuevo_sl_be
                             cierre_parcial = True
-                            emoji2 = "\U0001f7e2" if direction == "LONG" else "\U0001f534"
-                            msg_cp  = "\U0001f514 <b>CIERRE PARCIAL 50%</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
-                            msg_cp += "\U0001f3af TP1 @ " + fmt_fx(tp1) + "\n"
-                            msg_cp += "\U0001f4b0 P&L 50%: <b>+" + str(pnl_50) + "%</b>\n"
-                            msg_cp += "\U0001f504 SL breakeven: " + fmt_fx(nuevo_sl_be) + "\n"
-                            msg_cp += "\u23f3 50% restante apunta a TP2/TP3"
+                            ts_now = datetime.now(ARG_TZ).strftime("%d/%m %H:%M")
+                            emoji2 = "🟢" if direction == "LONG" else "🔴"
+                            msg_cp  = "🔔 <b>CIERRE PARCIAL 50%</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
+                            msg_cp += "🎯 TP1 @ " + fmt_fx(tp1) + "\n"
+                            msg_cp += "💰 P&L 50%: <b>+" + str(pnl_50) + "%</b>\n"
+                            msg_cp += "🔄 SL breakeven: " + fmt_fx(nuevo_sl_be) + "\n"
+                            msg_cp += "⏳ 50% restante apunta a TP2/TP3\n"
+                            msg_cp += "🕐 " + ts_now
                             send_telegram(msg_cp)
                         except Exception as e:
                             print("Error cierre parcial FX " + symbol + ": " + str(e))
@@ -296,7 +298,12 @@ def verificar_resultados_fx():
                     if precio_actual <= sl:
                         resultado    = "WIN" if cierre_parcial else "LOSS"
                         tp_alcanzado = 1 if cierre_parcial else 0
-                        pnl_pct      = round((precio_actual - entry) / entry * 100, 4)
+                        if cierre_parcial:
+                            pnl_tp1  = round((tp1 - entry) / entry * 100, 4)
+                            pnl_rest = round((precio_actual - entry) / entry * 100, 4)
+                            pnl_pct  = round((pnl_tp1 + pnl_rest) / 2, 4)
+                        else:
+                            pnl_pct = round((precio_actual - entry) / entry * 100, 4)
                     elif precio_actual >= tp3:
                         resultado = "WIN"; tp_alcanzado = 3
                         pnl_pct   = round((precio_actual - entry) / entry * 100, 4)
@@ -309,7 +316,12 @@ def verificar_resultados_fx():
                     if precio_actual >= sl:
                         resultado    = "WIN" if cierre_parcial else "LOSS"
                         tp_alcanzado = 1 if cierre_parcial else 0
-                        pnl_pct      = round((entry - precio_actual) / entry * 100, 4)
+                        if cierre_parcial:
+                            pnl_tp1  = round((entry - tp1) / entry * 100, 4)
+                            pnl_rest = round((entry - precio_actual) / entry * 100, 4)
+                            pnl_pct  = round((pnl_tp1 + pnl_rest) / 2, 4)
+                        else:
+                            pnl_pct = round((entry - precio_actual) / entry * 100, 4)
                     elif precio_actual <= tp3:
                         resultado = "WIN"; tp_alcanzado = 3
                         pnl_pct   = round((entry - precio_actual) / entry * 100, 4)
@@ -336,13 +348,20 @@ def verificar_resultados_fx():
                     """, (resultado, tp_alcanzado, precio_actual, pnl_pct, op_id))
                     conn.commit()
                     if resultado in ("WIN", "LOSS"):
-                        emoji  = "\u2705" if resultado == "WIN" else "\u274c"
-                        emoji2 = "\U0001f7e2" if direction == "LONG" else "\U0001f534"
+                        ts_now = datetime.now(ARG_TZ).strftime("%d/%m %H:%M")
+                        emoji  = "✅" if resultado == "WIN" else "❌"
+                        emoji2 = "🟢" if direction == "LONG" else "🔴"
                         msg    = emoji + " <b>" + resultado + "</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
-                        if resultado == "WIN": msg += "\U0001f3af TP" + str(tp_alcanzado) + " alcanzado\n"
-                        else:                  msg += "\U0001f6d1 SL tocado\n"
-                        msg += "\U0001f4ca Entrada: " + fmt_fx(entry) + " \u2192 " + fmt_fx(precio_actual) + "\n"
-                        msg += "\U0001f4b0 P&L: <b>" + ("+" if pnl_pct > 0 else "") + str(pnl_pct) + "%</b>"
+                        if resultado == "WIN": msg += "🎯 TP" + str(tp_alcanzado) + " alcanzado\n"
+                        else:                  msg += "🛑 SL tocado\n"
+                        msg += "📊 Entrada: " + fmt_fx(entry) + " → " + fmt_fx(precio_actual) + "\n"
+                        if cierre_parcial and tp_alcanzado == 1:
+                            pnl_tp1_show = round(abs(tp1 - entry) / entry * 100, 4)
+                            pnl_sl_show  = round(abs(precio_actual - entry) / entry * 100, 4)
+                            msg += "📈 50% en TP1: +" + str(pnl_tp1_show) + "%\n"
+                            msg += "📉 50% en breakeven: " + ("+" if precio_actual >= entry else "-") + str(pnl_sl_show) + "%\n"
+                        msg += "💰 P&L total: <b>" + ("+" if pnl_pct > 0 else "") + str(pnl_pct) + "%</b>\n"
+                        msg += "🕐 " + ts_now
                         send_telegram(msg)
             except Exception as e:
                 print("Error verificar FX " + symbol + ": " + str(e))
