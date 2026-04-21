@@ -12,6 +12,8 @@ import numpy as np
 import time
 import schedule
 import psycopg2
+import psycopg2.pool
+import threading
 import os
 import requests
 from datetime import datetime
@@ -76,15 +78,46 @@ SESION_INICIO = 6    # 6am ART = Londres abre
 SESION_FIN    = 20   # 8pm ART = NY cierra
 
 # =============================================================================
-#   BASE DE DATOS
+#   BASE DE DATOS — POOL DE CONEXIONES
 # =============================================================================
 
+_db_pool = None
+
+def init_db_pool():
+    """Inicializa el pool de conexiones PostgreSQL"""
+    global _db_pool
+    try:
+        _db_pool = psycopg2.pool.SimpleConnectionPool(
+            1, 10, os.environ["DATABASE_URL"]
+        )
+        print("Pool DB Forex inicializado OK")
+    except Exception as e:
+        print("Error inicializando pool DB Forex: " + str(e))
+
 def get_db():
+    """Obtiene una conexión del pool"""
+    global _db_pool
+    if _db_pool:
+        try:
+            return _db_pool.getconn()
+        except Exception as e:
+            print("Error obteniendo conexión del pool FX: " + str(e))
     try:
         return psycopg2.connect(os.environ["DATABASE_URL"])
     except Exception as e:
-        print("Error DB: " + str(e))
+        print("Error conexión directa DB FX: " + str(e))
         return None
+
+def release_db(conn):
+    """Devuelve la conexión al pool"""
+    global _db_pool
+    if _db_pool and conn:
+        try:
+            _db_pool.putconn(conn)
+        except Exception as e:
+            print("Error devolviendo conexión al pool FX: " + str(e))
+            try: conn.close()
+            except: pass
 
 
 def init_db():
@@ -163,7 +196,7 @@ def init_db():
     except Exception as e:
         print("Error init DB Forex: " + str(e))
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def ya_alerte_fx(symbol, direction, timeframe):
@@ -182,7 +215,7 @@ def ya_alerte_fx(symbol, direction, timeframe):
     except:
         return False
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def guardar_alerta_fx(s, tf_label):
@@ -227,7 +260,7 @@ def guardar_alerta_fx(s, tf_label):
     except Exception as e:
         print("Error guardar alerta FX: " + str(e))
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def verificar_resultados_fx():
@@ -368,7 +401,7 @@ def verificar_resultados_fx():
     except Exception as e:
         print("Error verificar_resultados_fx: " + str(e))
     finally:
-        conn.close()
+        release_db(conn)
 
 def reporte_tracking_fx():
     """Reporte de rendimiento del bot Forex — comando /fxreporte"""
@@ -416,7 +449,7 @@ def reporte_tracking_fx():
     except Exception as e:
         print("Error reporte_tracking_fx: " + str(e))
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_historial_fx(limite=20):
@@ -434,7 +467,7 @@ def get_historial_fx(limite=20):
     except:
         return []
     finally:
-        conn.close()
+        release_db(conn)
 
 # =============================================================================
 #   TELEGRAM
@@ -623,7 +656,8 @@ def get_htf_bias_fx(symbol_yf):
         if bull > bear:   return "BULLISH"
         elif bear > bull: return "BEARISH"
         return "NEUTRAL"
-    except:
+    except Exception as e:
+        print("⚠️ Error en get_htf_bias_fx: " + str(e))
         return "NEUTRAL"
 
 
@@ -634,7 +668,8 @@ def fmt_fx(p):
         elif p >= 10: return "{:.3f}".format(p)
         elif p >= 1:  return "{:.4f}".format(p)
         else:         return "{:.5f}".format(p)
-    except:
+    except Exception as e:
+        print("⚠️ Error en fmt_fx: " + str(e))
         return str(p)
 
 
@@ -708,7 +743,8 @@ def calc_rsi(closes, period=14):
         rs       = avg_gain / avg_loss
         val      = (100 - 100 / (1 + rs)).iloc[-1]
         return round(val, 2) if not np.isnan(val) else 50.0
-    except:
+    except Exception as e:
+        print("⚠️ Error en calc_rsi: " + str(e))
         return 50.0
 
 
@@ -748,7 +784,8 @@ def detect_rsi_divergence(df, period=14):
             rsi_lows[-1][1] > rsi_lows[-2][1] and rsi_lows[-1][1] < 55):
             divergence = "BULLISH_DIV"
         return divergence
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_rsi_divergence: " + str(e))
         return None
 
 
@@ -816,7 +853,8 @@ def detect_ob(df):
                 if fl < c["low"] and c["low"] * 0.995 <= price <= c["high"]:
                     ob_bear = {"high": round(c["high"], 6), "low": round(c["low"], 6)}
             if ob_bull and ob_bear: break
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_ob: " + str(e))
         pass
     return ob_bull, ob_bear
 
@@ -838,7 +876,8 @@ def detect_fvg(df):
                 if gap_size > 0.02 and gl <= price <= gh:
                     fvg_bear = {"high": round(gh, 6), "low": round(gl, 6), "size": round(gap_size, 3)}
             if fvg_bull and fvg_bear: break
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_fvg: " + str(e))
         pass
     return fvg_bull, fvg_bear
 
@@ -864,7 +903,8 @@ def detect_structure(df):
                 return "BOS_BULL" if lh > ph else "CHoCH_BULL"
             if lc < ll and pc >= ll and (len(df) - last_low_idx) <= 50:
                 return "BOS_BEAR" if ll < pl else "CHoCH_BEAR"
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_structure: " + str(e))
         pass
     return None
 
@@ -916,7 +956,8 @@ def detect_fibonacci(df, lookback=100):
                 else:                desc = "Fib 0.382 — retroceso moderado"
                 return nivel, desc, direccion
         return None, None, None
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_fibonacci: " + str(e))
         return None, None, None
 
 
@@ -944,7 +985,8 @@ def detect_hh_ll(df, lookback=50):
             last_l, prev_l = lows[-1][1], lows[-2][1]
             if last_l < prev_l and abs(price - last_l) / price <= 0.008:
                 return "LL", round(last_l, 6)
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_hh_ll: " + str(e))
         pass
     return None, None
 
@@ -968,7 +1010,8 @@ def detect_candle(df):
         if (c["close"] > c["open"] and p["close"] < p["open"] and
             c["open"] <= p["close"] and c["close"] >= p["open"]):
             patterns.append("Engulfing alcista")
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_candle: " + str(e))
         pass
     return patterns
 
@@ -980,7 +1023,8 @@ def calc_vol(df):
         if avg == 0: return 100, False
         ratio = round((last/avg)*100)
         return ratio, ratio >= 150
-    except:
+    except Exception as e:
+        print("⚠️ Error en calc_vol: " + str(e))
         return 100, False
 
 
@@ -989,7 +1033,8 @@ def calc_volatility(df):
         if len(df) < 5: return 0.0
         n = min(20, len(df))
         return round(((df["high"]-df["low"])/df["close"]*100).iloc[-n:].mean(), 4)
-    except:
+    except Exception as e:
+        print("⚠️ Error en calc_volatility: " + str(e))
         return 0.0
 
 
@@ -1008,7 +1053,8 @@ def calc_atr(df, period=14):
         atr     = tr.ewm(span=period, adjust=False).mean().iloc[-1]
         atr_pct = round(atr / close.iloc[-1] * 100, 3)
         return atr_pct
-    except:
+    except Exception as e:
+        print("⚠️ Error en calc_atr: " + str(e))
         return 0.0
 
 
@@ -1034,7 +1080,8 @@ def tiene_direccionalidad(df, period=14):
         atr_sum = tr.iloc[-n:].sum() / close.iloc[-1] * 100
         if atr_sum == 0: return True
         return (mov_neto / atr_sum) >= 0.25
-    except:
+    except Exception as e:
+        print("⚠️ Error en tiene_direccionalidad: " + str(e))
         return True
 
 
@@ -1063,7 +1110,8 @@ def calcular_trailing_sl(direction, precio_actual, precio_entry, sl_original, at
             elif multiplicador >= 1.5:
                 return round(precio_entry - riesgo * 0.1, 6)
         return sl_original
-    except:
+    except Exception as e:
+        print("⚠️ Error en calcular_trailing_sl: " + str(e))
         return sl_original
 
 # =============================================================================
@@ -1500,6 +1548,7 @@ def resumen_diario_fx():
 
 if __name__ == "__main__":
     print("Forex Scanner Bot v1.0 iniciado...")
+    init_db_pool()  # Pool de conexiones primero
     init_db()
     send_telegram(
         "<b>💱 Forex Scanner Bot v1.0 ACTIVO</b>\n\n"

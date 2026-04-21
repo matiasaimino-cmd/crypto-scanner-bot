@@ -11,6 +11,8 @@ import numpy as np
 import time
 import schedule
 import psycopg2
+import psycopg2.pool
+import threading
 import os
 import html as html_lib
 from datetime import datetime
@@ -30,14 +32,14 @@ BINANCE_BASE        = "https://api.binance.com/api/v3"
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("❌ Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en variables de entorno")
 
-MIN_SCORE_BASE      = 7   # Score mínimo base — se ajusta dinámicamente
-MIN_SCORE           = 7   # Score activo — actualizado por get_min_score_adaptativo()
+MIN_SCORE_BASE      = 7
+MIN_SCORE           = 7
 RSI_OVERBOUGHT      = 70
 RSI_OVERSOLD        = 30
 RSI_EXTREME         = 75
 ALERTA_COOLDOWN_MIN = 30
 
-# Session HTTP con reintentos automáticos — evita colapso por errores 429/5xx
+# Session HTTP con reintentos automáticos
 _session = requests.Session()
 _retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
 _session.mount("https://", HTTPAdapter(max_retries=_retries))
@@ -55,16 +57,47 @@ INTERVALS = [
 ]
 
 # =============================================================================
-#   BASE DE DATOS
+#   BASE DE DATOS — POOL DE CONEXIONES
 # =============================================================================
 
+_db_pool = None
+
+def init_db_pool():
+    """Inicializa el pool de conexiones PostgreSQL — se llama una sola vez al arrancar"""
+    global _db_pool
+    try:
+        _db_pool = psycopg2.pool.SimpleConnectionPool(
+            1, 10, os.environ["DATABASE_URL"]
+        )
+        print("Pool DB inicializado OK")
+    except Exception as e:
+        print("Error inicializando pool DB: " + str(e))
+
 def get_db():
-    """Retorna conexión a PostgreSQL"""
+    """Obtiene una conexión del pool"""
+    global _db_pool
+    if _db_pool:
+        try:
+            return _db_pool.getconn()
+        except Exception as e:
+            print("Error obteniendo conexión del pool: " + str(e))
+    # Fallback — conexión directa si el pool falla
     try:
         return psycopg2.connect(os.environ["DATABASE_URL"])
     except Exception as e:
-        print("Error DB: " + str(e))
+        print("Error conexión directa DB: " + str(e))
         return None
+
+def release_db(conn):
+    """Devuelve la conexión al pool en lugar de cerrarla"""
+    global _db_pool
+    if _db_pool and conn:
+        try:
+            _db_pool.putconn(conn)
+        except Exception as e:
+            print("Error devolviendo conexión al pool: " + str(e))
+            try: conn.close()
+            except: pass
 
 
 def init_db():
@@ -195,7 +228,7 @@ def init_db():
     except Exception as e:
         print("Error init DB: " + str(e))
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def ya_alerte(symbol, direction, timeframe):
@@ -219,7 +252,7 @@ def ya_alerte(symbol, direction, timeframe):
     except:
         return False
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def guardar_alerta(s, tf_label):
@@ -267,7 +300,7 @@ def guardar_alerta(s, tf_label):
     except Exception as e:
         print("Error guardar alerta: " + str(e))
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def verificar_resultados():
@@ -470,7 +503,7 @@ def verificar_resultados():
     except Exception as e:
         print("Error verificar resultados: " + str(e))
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def reporte_tracking():
@@ -583,7 +616,7 @@ def reporte_tracking():
     except Exception as e:
         print("Error reporte_tracking: " + str(e))
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def guardar_estado(symbol, timeframe, rsi, estructura, htf_bias, divergencia, precio):
@@ -608,7 +641,7 @@ def guardar_estado(symbol, timeframe, rsi, estructura, htf_bias, divergencia, pr
     except Exception as e:
         print("Error guardar estado: " + str(e))
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def guardar_rsi(symbol, timeframe, rsi, precio):
@@ -634,7 +667,7 @@ def guardar_rsi(symbol, timeframe, rsi, precio):
     except Exception as e:
         print("Error guardar RSI: " + str(e))
     finally:
-        conn.close()
+        release_db(conn)
 
 
 def get_historial_alertas(limite=20):
@@ -653,7 +686,7 @@ def get_historial_alertas(limite=20):
     except:
         return []
     finally:
-        conn.close()
+        release_db(conn)
 
 # =============================================================================
 #   TELEGRAM
@@ -718,7 +751,8 @@ def procesar_comandos(last_update_id):
             scan_all()
         elif text == "/backtest":
             print("Comando /backtest recibido")
-            run_backtest()
+            send_telegram("⏳ Iniciando backtesting en segundo plano...\nEl escaneo en vivo continúa sin interrupciones.")
+            threading.Thread(target=run_backtest, daemon=True).start()
         elif text == "/reporte":
             print("Comando /reporte recibido")
             reporte_tracking()
@@ -787,6 +821,8 @@ def calc_rsi(closes, period=14):
         rs       = avg_gain / avg_loss
         val      = (100 - 100 / (1 + rs)).iloc[-1]
         return round(val, 2) if not np.isnan(val) else 50.0
+    except Exception as e:
+        print("⚠️ Error en calc_rsi: " + str(e))
     except:
         return 50.0
 
@@ -841,7 +877,8 @@ def detect_rsi_divergence(df, period=14):
             rsi_lows[-1][1]   < 55):
             divergence = "BULLISH_DIV"
         return divergence
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_rsi_divergence: " + str(e))
         return None
 
 
@@ -870,6 +907,8 @@ def get_btc_momentum(interval):
         if bull > bear:   return "BULLISH"
         elif bear > bull: return "BEARISH"
         return "NEUTRAL"
+    except Exception as e:
+        print("⚠️ Error en get_btc_momentum: " + str(e))
     except:
         return "NEUTRAL"
 
@@ -962,6 +1001,8 @@ def get_htf_bias(symbol, interval):
         if bull > bear:   return "BULLISH"
         elif bear > bull: return "BEARISH"
         return "NEUTRAL"
+    except Exception as e:
+        print("⚠️ Error en get_htf_bias: " + str(e))
     except:
         return "NEUTRAL"
 
@@ -995,6 +1036,8 @@ def get_1h_bias(symbol):
         if bull > bear:   return "BULLISH"
         elif bear > bull: return "BEARISH"
         return "NEUTRAL"
+    except Exception as e:
+        print("⚠️ Error en get_1h_bias: " + str(e))
     except:
         return "NEUTRAL"
 
@@ -1070,7 +1113,8 @@ def detect_ob(df):
                 if fl < c["low"] and c["low"] * 0.995 <= price <= c["high"]:
                     ob_bear = {"high": round(c["high"], 6), "low": round(c["low"], 6)}
             if ob_bull and ob_bear: break
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_ob: " + str(e))
         pass
     return ob_bull, ob_bear
 
@@ -1097,7 +1141,8 @@ def detect_fvg(df):
                 if gap_size > 0.05 and gl <= price <= gh:
                     fvg_bear = {"high": round(gh, 6), "low": round(gl, 6), "size": round(gap_size, 3)}
             if fvg_bull and fvg_bear: break
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_fvg: " + str(e))
         pass
     return fvg_bull, fvg_bear
 
@@ -1128,7 +1173,8 @@ def detect_structure(df):
                 return "BOS_BULL" if lh > ph else "CHoCH_BULL"
             if lc < ll and pc >= ll and (len(df) - last_low_idx) <= 50:
                 return "BOS_BEAR" if ll < pl else "CHoCH_BEAR"
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_structure: " + str(e))
         pass
     return None
 
@@ -1204,6 +1250,8 @@ def detect_fibonacci(df, lookback=100):
                 return nivel, desc, direccion
 
         return None, None, None
+    except Exception as e:
+        print("⚠️ Error en detect_fibonacci: " + str(e))
     except:
         return None, None, None
 
@@ -1238,7 +1286,8 @@ def detect_hh_ll(df, lookback=50):
             last_l, prev_l = lows[-1][1], lows[-2][1]
             if last_l < prev_l and abs(price - last_l) / price <= 0.008:
                 return "LL", round(last_l, 6)
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_hh_ll: " + str(e))
         pass
     return None, None
 
@@ -1263,7 +1312,8 @@ def detect_candle(df):
         if (c["close"] > c["open"] and p["close"] < p["open"] and
             c["open"] <= p["close"] and c["close"] >= p["open"]):
             patterns.append("Engulfing alcista")
-    except:
+    except Exception as e:
+        print("⚠️ Error en detect_candle: " + str(e))
         pass
     return patterns
 
@@ -1279,6 +1329,8 @@ def calc_vol(df):
         if avg == 0: return 100, False
         ratio = round((last/avg)*100)
         return ratio, ratio >= 150
+    except Exception as e:
+        print("⚠️ Error en calc_vol: " + str(e))
     except:
         return 100, False
 
@@ -1289,6 +1341,8 @@ def calc_volatility(df):
         if len(df) < 5: return 0.0
         n = min(20, len(df))
         return round(((df["high"]-df["low"])/df["close"]*100).iloc[-n:].mean(), 2)
+    except Exception as e:
+        print("⚠️ Error en calc_volatility: " + str(e))
     except:
         return 0.0
 
@@ -1311,6 +1365,8 @@ def calc_atr(df, period=14):
         atr     = tr.ewm(span=period, adjust=False).mean().iloc[-1]
         atr_pct = round(atr / close.iloc[-1] * 100, 3)
         return atr_pct
+    except Exception as e:
+        print("⚠️ Error en calc_atr: " + str(e))
     except:
         return 0.0
 
@@ -1349,6 +1405,8 @@ def tiene_direccionalidad(df, period=14):
 
         # Si el precio se movió menos del 25% del rango total → sin direccionalidad
         return ratio >= 0.25
+    except Exception as e:
+        print("⚠️ Error en tiene_direccionalidad: " + str(e))
     except:
         return True  # en caso de error, no bloquear
 
@@ -2175,6 +2233,7 @@ def resumen_diario():
 
 if __name__ == "__main__":
     print("Bot Scanner Crypto v4.3 iniciado...")
+    init_db_pool()  # Inicializar pool de conexiones primero
     init_db()
     send_telegram(
         "<b>🤖 Bot Scanner Crypto v4.3 ACTIVO</b>\n\n"
