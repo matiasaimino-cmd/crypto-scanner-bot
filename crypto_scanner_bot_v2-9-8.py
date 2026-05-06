@@ -1,5 +1,5 @@
 # =============================================================================
-#   CRYPTO SCANNER BOT v4.3
+#   CRYPTO SCANNER BOT v4.4
 #   Autor: matiasaimino-cmd
 #   Descripción: Scanner de crypto con análisis técnico automatizado
 #   Plataforma: Railway + PostgreSQL + Telegram
@@ -32,8 +32,8 @@ BINANCE_BASE        = "https://api.binance.com/api/v3"
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("❌ Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en variables de entorno")
 
-MIN_SCORE_BASE      = 7
-MIN_SCORE           = 7
+MIN_SCORE_BASE      = 8
+MIN_SCORE           = 8
 RSI_OVERBOUGHT      = 70
 RSI_OVERSOLD        = 30
 RSI_EXTREME         = 75
@@ -46,10 +46,11 @@ _session.mount("https://", HTTPAdapter(max_retries=_retries))
 
 SYMBOLS = [
     "BTCUSDT",  "ETHUSDT",  "SOLUSDT",   "XRPUSDT",  "DOGEUSDT",
-    "ADAUSDT",  "AVAXUSDT", "DOTUSDT",   "PEPEUSDT",  "LTCUSDT",
+    "ADAUSDT",  "AVAXUSDT", "DOTUSDT",   "LINKUSDT",  "LTCUSDT",
     "ATOMUSDT", "NEARUSDT", "HBARUSDT",  "THETAUSDT", "FTMUSDT",
     "SANDUSDT", "MANAUSDT", "RUNEUSDT",  "OPUSDT",    "RENDERUSDT"
 ]
+# v4.4: PEPEUSDT reemplazado por LINKUSDT (menor volatilidad extrema)
 
 INTERVALS = [
     ("15m", "Scalping 15m"),
@@ -1748,6 +1749,17 @@ def analyze_symbol(symbol, interval):
             # 0. Filtro ATR — no operar activos sin direccionalidad (en rango)
             if not direccional: continue
 
+            # 0b. Filtro de volatilidad extrema — v4.4
+            # Si las últimas 4 velas tienen ATR% promedio > 3.5%, el activo está
+            # en modo pánico/pump y las señales son muy poco confiables.
+            try:
+                atr_reciente = ((df["high"].iloc[-4:] - df["low"].iloc[-4:]) / df["close"].iloc[-4:] * 100).mean()
+                if atr_reciente > 3.5:
+                    print("⛔ Volatilidad extrema " + symbol + " ATR4=" + str(round(atr_reciente, 2)) + "% — skip")
+                    continue
+            except:
+                pass
+
             # 1. RSI direccional
             if direction == "SHORT" and rsi < 50 and rsi < RSI_EXTREME: continue
             if direction == "LONG"  and rsi > 50 and rsi > (100-RSI_EXTREME): continue
@@ -1817,8 +1829,15 @@ def analyze_symbol(symbol, interval):
             # 12. Volumen mínimo 20%
             if vol_r < 20: continue
 
-            # 13. Score mínimo
-            if score < MIN_SCORE: continue
+            # 13. Score mínimo — umbrales diferenciados por tipo/dirección
+            # v4.4: SHORTs requieren score >= 9 (mercado con sesgo alcista)
+            # v4.4: REVERSIÓN requiere score >= 9 (setup de mayor riesgo)
+            score_minimo = MIN_SCORE
+            if direction == "SHORT":
+                score_minimo = max(score_minimo, 9)
+            if tipo_setup == "REVERSION":
+                score_minimo = max(score_minimo, 9)
+            if score < score_minimo: continue
 
             # 14. Cooldown — verificar ANTES de agregar al resultado
             if ya_alerte(symbol, direction, interval): continue
@@ -2232,16 +2251,17 @@ def resumen_diario():
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Bot Scanner Crypto v4.3 iniciado...")
+    print("Bot Scanner Crypto v4.4 iniciado...")
     init_db_pool()  # Inicializar pool de conexiones primero
     init_db()
     send_telegram(
-        "<b>🤖 Bot Scanner Crypto v4.3 ACTIVO</b>\n\n"
-        "✅ Novedades v4.3:\n"
-        "— Fibonacci agregado (0.382/0.5/0.618/0.786/0.886)\n"
-        "— Correlación BTC como filtro\n"
-        "— Filtro 1H intermedio para 15m\n"
-        "— Código limpio sin errores\n\n"
+        "<b>🤖 Bot Scanner Crypto v4.4 ACTIVO</b>\n\n"
+        "✅ Novedades v4.4:\n"
+        "— MIN_SCORE subido a 8 (menos señales, más calidad)\n"
+        "— SHORTs requieren score >= 9\n"
+        "— REVERSIÓN requiere score >= 9\n"
+        "— Filtro volatilidad extrema ATR4 > 3.5%\n"
+        "— PEPEUSDT reemplazado por LINKUSDT\n\n"
         "⚙️ Score mínimo: " + str(MIN_SCORE) + "/10\n"
         "⏱ Cooldown: " + str(ALERTA_COOLDOWN_MIN) + " minutos\n"
         "🔄 Escaneo cada 5 minutos\n\n"
