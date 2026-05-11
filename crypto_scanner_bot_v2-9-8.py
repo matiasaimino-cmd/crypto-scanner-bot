@@ -348,9 +348,9 @@ def verificar_resultados():
                     atr_pct_trail = calc_atr(df_trail) if df_trail is not None else 1.0
                     nuevo_sl      = calcular_trailing_sl(direction, precio_actual, entry, sl, atr_pct_trail)
                     if nuevo_sl != sl:
-                        cur.execute("UPDATE tracking SET sl = %s WHERE id = %s", (nuevo_sl, op_id))
+                        cur.execute("UPDATE tracking SET sl = %s WHERE id = %s", (float(nuevo_sl), op_id))
                         conn.commit()
-                        sl = nuevo_sl
+                        sl = float(nuevo_sl)
                 except Exception as e:
                     print("Error trailing stop " + symbol + ": " + str(e))
 
@@ -1589,21 +1589,21 @@ def calcular_trailing_sl(direction, precio_actual, precio_entry, sl_original, at
             if multiplicador >= 3.5:
                 # Trailing en TP2 — mover SL a precio_entry + 2.5× riesgo
                 nuevo_sl = precio_actual - atr_abs * 1.5
-                return round(max(nuevo_sl, precio_entry + riesgo_original * 2.5), 6)
+                return float(round(max(nuevo_sl, precio_entry + riesgo_original * 2.5), 6))
             elif multiplicador >= 2.5:
                 # Mover SL a TP1
-                return round(precio_entry + riesgo_original * 2.0, 6)
+                return float(round(precio_entry + riesgo_original * 2.0, 6))
             elif multiplicador >= 1.5:
                 # Mover SL a breakeven
-                return round(precio_entry + riesgo_original * 0.1, 6)
+                return float(round(precio_entry + riesgo_original * 0.1, 6))
         else:  # SHORT
             if multiplicador >= 3.5:
                 nuevo_sl = precio_actual + atr_abs * 1.5
-                return round(min(nuevo_sl, precio_entry - riesgo_original * 2.5), 6)
+                return float(round(min(nuevo_sl, precio_entry - riesgo_original * 2.5), 6))
             elif multiplicador >= 2.5:
-                return round(precio_entry - riesgo_original * 2.0, 6)
+                return float(round(precio_entry - riesgo_original * 2.0, 6))
             elif multiplicador >= 1.5:
-                return round(precio_entry - riesgo_original * 0.1, 6)
+                return float(round(precio_entry - riesgo_original * 0.1, 6))
 
         return sl_original
     except:
