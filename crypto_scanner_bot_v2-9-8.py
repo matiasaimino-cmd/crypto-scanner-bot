@@ -1,5 +1,5 @@
 # =============================================================================
-#   CRYPTO SCANNER BOT v4.4
+#   CRYPTO SCANNER BOT v4.5
 #   Autor: matiasaimino-cmd
 #   Descripción: Scanner de crypto con análisis técnico automatizado
 #   Plataforma: Railway + PostgreSQL + Telegram
@@ -893,18 +893,36 @@ def get_btc_momentum(interval):
     try:
         df    = get_klines("BTCUSDT", interval, limit=30)
         if df is None: return "NEUTRAL"
-        price = df["close"].iloc[-1]
-        prev3 = df["close"].iloc[-4]
-        ema20 = df["close"].ewm(span=20, adjust=False, min_periods=10).mean().iloc[-1]
-        cambio = (price - prev3) / prev3 * 100
+        price  = df["close"].iloc[-1]
+        prev3  = df["close"].iloc[-4]   # momentum corto (3 velas)
+        prev6  = df["close"].iloc[-7]   # momentum medio (6 velas) — v4.5
+        ema20  = df["close"].ewm(span=20, adjust=False, min_periods=10).mean().iloc[-1]
+        ema9   = df["close"].ewm(span=9,  adjust=False, min_periods=5).mean().iloc[-1]
+        cambio3 = (price - prev3) / prev3 * 100
+        cambio6 = (price - prev6) / prev6 * 100
         bull, bear = 0, 0
-        if cambio > 0.3:    bull += 2
-        elif cambio < -0.3: bear += 2
+
+        # Cambio 3 velas
+        if cambio3 > 0.3:    bull += 2
+        elif cambio3 < -0.3: bear += 2
+
+        # Cambio 6 velas — más peso para capturar reversiones
+        if cambio6 > 0.8:    bull += 2
+        elif cambio6 < -0.8: bear += 2
+
+        # EMA20
         if price > ema20: bull += 1
         else:             bear += 1
+
+        # EMA9 — más reactiva a reversiones recientes
+        if price > ema9: bull += 1
+        else:            bear += 1
+
+        # Vela actual
         last = df.iloc[-1]
         if last["close"] > last["open"]: bull += 1
         else:                            bear += 1
+
         if bull > bear:   return "BULLISH"
         elif bear > bull: return "BEARISH"
         return "NEUTRAL"
@@ -943,9 +961,9 @@ def get_min_score_adaptativo():
             MIN_SCORE = min(MIN_SCORE_BASE + 1, 9)
             print("Score adaptativo: " + str(MIN_SCORE) + " (alta volatilidad BTC ATR=" + str(atr_btc) + "%)")
         elif not direccional:
-            # BTC en rango — más ruido
-            MIN_SCORE = min(MIN_SCORE_BASE + 1, 9)
-            print("Score adaptativo: " + str(MIN_SCORE) + " (BTC en rango)")
+            # BTC en rango — mantener score base (v4.5: el filtro de extremos ya filtra)
+            MIN_SCORE = MIN_SCORE_BASE
+            print("Score adaptativo: " + str(MIN_SCORE) + " (BTC en rango — score base)")
         else:
             # Tendencia clara — score normal
             MIN_SCORE = MIN_SCORE_BASE
@@ -1372,7 +1390,7 @@ def calc_atr(df, period=14):
         return 0.0
 
 
-def tiene_direccionalidad(df, period=14):
+def tiene_direccionalidad(df, period=10):
     """
     Filtra activos sin direccionalidad usando ADX simplificado.
     Compara el movimiento direccional (DM) con el rango total (ATR).
@@ -1404,8 +1422,9 @@ def tiene_direccionalidad(df, period=14):
         if atr_sum == 0: return True
         ratio = movimiento_neto / atr_sum
 
-        # Si el precio se movió menos del 25% del rango total → sin direccionalidad
-        return ratio >= 0.25
+        # Si el precio se movió menos del 15% del rango total → sin direccionalidad
+        # v4.5: bajado de 0.25 a 0.15 para capturar reversiones en curso
+        return ratio >= 0.15
     except Exception as e:
         print("⚠️ Error en tiene_direccionalidad: " + str(e))
     except:
@@ -1746,8 +1765,20 @@ def analyze_symbol(symbol, interval):
 
             # ── FILTROS DE ENTRADA ───────────────────────────────────────────
 
-            # 0. Filtro ATR — no operar activos sin direccionalidad (en rango)
-            if not direccional: continue
+            # 0. Filtro de rango — v4.5
+            # En tendencia: opera normalmente en dirección del bias.
+            # En rango: solo permite entradas en los EXTREMOS del rango
+            #   → LONG cerca del soporte (parte baja) — precio dentro del 1.5% del sup
+            #   → SHORT cerca de la resistencia (parte alta) — precio dentro del 1.5% del res
+            # El medio del rango se descarta (demasiado ruido).
+            en_rango = not direccional
+            if en_rango:
+                cerca_soporte    = abs(price - sup) / price <= 0.015
+                cerca_resistencia = abs(price - res) / price <= 0.015
+                if direction == "LONG"  and not cerca_soporte:    continue
+                if direction == "SHORT" and not cerca_resistencia: continue
+                # Etiquetar condición para el mensaje y DB
+                condicion_mercado = "RANGO"
 
             # 0b. Filtro de volatilidad extrema — v4.4
             # Si las últimas 4 velas tienen ATR% promedio > 3.5%, el activo está
@@ -1768,19 +1799,21 @@ def analyze_symbol(symbol, interval):
             # HTF BAJISTA → solo SHORTs | HTF ALCISTA → solo LONGs
             # Excepción: HTF NEUTRAL permite ambas direcciones
             # Excepción: RSI extremo permite operar contra (agotamiento)
-            rsi_extremo = (direction == "SHORT" and rsi >= RSI_EXTREME) or \
-                          (direction == "LONG"  and rsi <= (100-RSI_EXTREME))
-            if not rsi_extremo:
+            # Excepción: en RANGO los filtros HTF/BTC se relajan — los extremos
+            #            del rango son válidos independientemente del bias HTF
+            rsi_extremo = (direction == "SHORT" and rsi >= RSI_EXTREME) or                           (direction == "LONG"  and rsi <= (100-RSI_EXTREME))
+            if not rsi_extremo and not en_rango:
                 if htf_bias == "BEARISH" and direction == "LONG":  continue
                 if htf_bias == "BULLISH" and direction == "SHORT": continue
 
             # 3. Filtro 1H intermedio (solo para trades de 15m)
-            if bias_1h is not None and not rsi_extremo:
+            if bias_1h is not None and not rsi_extremo and not en_rango:
                 if direction == "SHORT" and bias_1h == "BULLISH": continue
                 if direction == "LONG"  and bias_1h == "BEARISH": continue
 
             # 4. Correlación BTC — no operar contra el impulso de BTC
-            if not rsi_extremo:
+            # En rango también se relaja — el BTC puede estar en rango también
+            if not rsi_extremo and not en_rango:
                 if direction == "SHORT" and btc_momentum == "BULLISH": continue
                 if direction == "LONG"  and btc_momentum == "BEARISH": continue
 
@@ -1788,6 +1821,12 @@ def analyze_symbol(symbol, interval):
             score, labels = calc_score(direction, rsi, ob, fvg, structure, candles, vol_h, near, divergence, htf_bias)
             tipo_setup    = clasificar_setup(direction, rsi, structure, divergence, htf_bias)
             if tipo_setup == "REBOTE": score = min(score, 5)
+
+            # En rango: agregar label informativo y bonus por estar en extremo confirmado
+            if en_rango:
+                extremo_label = "📦 RANGO — " + ("soporte" if direction == "LONG" else "resistencia") + " (" + str(round(abs(price - (sup if direction == "LONG" else res)) / price * 100, 2)) + "% del nivel)"
+                labels.insert(0, extremo_label)
+                score = min(score + 1, 10)  # bonus por confluencia con extremo de rango
 
             # Sumar Fibonacci al score si coincide con la dirección
             fib_valido = fib_nivel is not None and fib_dir == direction
@@ -2251,17 +2290,16 @@ def resumen_diario():
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Bot Scanner Crypto v4.4 iniciado...")
+    print("Bot Scanner Crypto v4.5 iniciado...")
     init_db_pool()  # Inicializar pool de conexiones primero
     init_db()
     send_telegram(
-        "<b>🤖 Bot Scanner Crypto v4.4 ACTIVO</b>\n\n"
-        "✅ Novedades v4.4:\n"
-        "— MIN_SCORE subido a 8 (menos señales, más calidad)\n"
-        "— SHORTs requieren score >= 9\n"
-        "— REVERSIÓN requiere score >= 9\n"
-        "— Filtro volatilidad extrema ATR4 > 3.5%\n"
-        "— PEPEUSDT reemplazado por LINKUSDT\n\n"
+        "<b>🤖 Bot Scanner Crypto v4.5 ACTIVO</b>\n\n"
+        "✅ Novedades v4.5:\n"
+        "— Entradas en rango habilitadas (extremos S/R)\n"
+        "— Filtros HTF/BTC relajados en modo rango\n"
+        "— Bonus +1 score en extremo de rango confirmado\n"
+        "— Fix np.float64 trailing stop\n\n"
         "⚙️ Score mínimo: " + str(MIN_SCORE) + "/10\n"
         "⏱ Cooldown: " + str(ALERTA_COOLDOWN_MIN) + " minutos\n"
         "🔄 Escaneo cada 5 minutos\n\n"
