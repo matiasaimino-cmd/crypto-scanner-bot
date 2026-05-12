@@ -824,7 +824,6 @@ def calc_rsi(closes, period=14):
         return round(val, 2) if not np.isnan(val) else 50.0
     except Exception as e:
         print("⚠️ Error en calc_rsi: " + str(e))
-    except:
         return 50.0
 
 
@@ -928,7 +927,6 @@ def get_btc_momentum(interval):
         return "NEUTRAL"
     except Exception as e:
         print("⚠️ Error en get_btc_momentum: " + str(e))
-    except:
         return "NEUTRAL"
 
 
@@ -1302,7 +1300,6 @@ def detect_fibonacci(df, lookback=100):
         return None, None, None
     except Exception as e:
         print("⚠️ Error en detect_fibonacci: " + str(e))
-    except:
         return None, None, None
 
 
@@ -1381,7 +1378,6 @@ def calc_vol(df):
         return ratio, ratio >= 150
     except Exception as e:
         print("⚠️ Error en calc_vol: " + str(e))
-    except:
         return 100, False
 
 
@@ -1393,7 +1389,6 @@ def calc_volatility(df):
         return round(((df["high"]-df["low"])/df["close"]*100).iloc[-n:].mean(), 2)
     except Exception as e:
         print("⚠️ Error en calc_volatility: " + str(e))
-    except:
         return 0.0
 
 
@@ -1417,7 +1412,6 @@ def calc_atr(df, period=14):
         return atr_pct
     except Exception as e:
         print("⚠️ Error en calc_atr: " + str(e))
-    except:
         return 0.0
 
 
@@ -1458,7 +1452,6 @@ def tiene_direccionalidad(df, period=10):
         return ratio >= 0.15
     except Exception as e:
         print("⚠️ Error en tiene_direccionalidad: " + str(e))
-    except:
         return True  # en caso de error, no bloquear
 
 # =============================================================================
