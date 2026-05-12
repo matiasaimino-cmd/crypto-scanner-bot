@@ -978,35 +978,43 @@ def get_min_score_adaptativo():
 
 def get_htf_bias(symbol, interval):
     """
-    Sesgo del marco temporal mayor (HTF).
-    Para 15m/1h usa 4H. Evalúa EMA50, EMA200 y estructura.
-    Retorna NEUTRAL si no hay suficientes velas para calcular EMAs.
+    Sesgo del marco temporal mayor (HTF) — 4H para 15m/1H.
+    Lógica EMA:
+      EMA3 / EMA9  → cruce rápido: detecta inicio de movimiento
+      EMA100       → tendencia de fondo: precio sobre = alcista, bajo = bajista
+    El cruce EMA3/9 define la dirección; EMA100 la confirma o penaliza.
+    Retorna: BULLISH | BEARISH | NEUTRAL
     """
     try:
         next_tf = "4h" if interval in ("15m", "1h") else "1d"
-        df      = get_klines(symbol, next_tf, limit=250)
-        if df is None or len(df) < 60: return "NEUTRAL"  # mínimo 60 velas
+        df      = get_klines(symbol, next_tf, limit=150)
+        if df is None or len(df) < 20: return "NEUTRAL"
 
         closes = df["close"]
         price  = closes.iloc[-1]
-        ema50  = closes.ewm(span=50,  adjust=False, min_periods=50).mean().iloc[-1]
-        ema200 = closes.ewm(span=200, adjust=False, min_periods=200).mean().iloc[-1]
+        ema3   = closes.ewm(span=3,   adjust=False, min_periods=3).mean()
+        ema9   = closes.ewm(span=9,   adjust=False, min_periods=9).mean()
+        ema100 = closes.ewm(span=100, adjust=False, min_periods=20).mean()
 
-        # Si no hay suficientes datos para EMA200, usar solo EMA50 y estructura
-        if np.isnan(ema200):
-            bull, bear = 0, 0
-            if not np.isnan(ema50):
-                if price > ema50: bull += 2
-                else:             bear += 2
-        else:
-            bull, bear = 0, 0
-            if price > ema50:  bull += 1
-            else:              bear += 1
-            if price > ema200: bull += 1
-            else:              bear += 1
-            if ema50 > ema200: bull += 1
-            else:              bear += 1
+        ema3_now   = ema3.iloc[-1];   ema3_prev  = ema3.iloc[-2]
+        ema9_now   = ema9.iloc[-1];   ema9_prev  = ema9.iloc[-2]
+        ema100_now = ema100.iloc[-1]
 
+        bull, bear = 0, 0
+
+        # ── Cruce EMA3/9 — señal de dirección ───────────────────────────────
+        cruce_alcista = ema3_prev <= ema9_prev and ema3_now > ema9_now
+        cruce_bajista = ema3_prev >= ema9_prev and ema3_now < ema9_now
+        if cruce_alcista:           bull += 3
+        elif cruce_bajista:         bear += 3
+        elif ema3_now > ema9_now:   bull += 2   # sin cruce pero EMA3 sobre EMA9
+        else:                       bear += 2
+
+        # ── EMA100 — tendencia de fondo ──────────────────────────────────────
+        if price > ema100_now:  bull += 2
+        else:                   bear += 2
+
+        # ── Estructura de swings HH/HL vs LH/LL ─────────────────────────────
         highs, lows = [], []
         for i in range(2, len(df) - 2):
             if df["high"].iloc[i] > df["high"].iloc[i-1] and df["high"].iloc[i] > df["high"].iloc[i+1]:
@@ -1022,24 +1030,47 @@ def get_htf_bias(symbol, interval):
         return "NEUTRAL"
     except Exception as e:
         print("⚠️ Error en get_htf_bias: " + str(e))
-    except:
         return "NEUTRAL"
 
 
 def get_1h_bias(symbol):
     """
-    Sesgo del 1H — filtro intermedio para trades de 15m.
+    Sesgo intermedio 1H — filtro para trades de 15m.
+    Lógica EMA:
+      EMA3 / EMA9  → cruce rápido: detecta inicio de movimiento en 1H
+      EMA100       → tendencia de fondo 1H
+    Combina cruce, posición relativa y estructura de swings.
     Retorna: BULLISH | BEARISH | NEUTRAL
     """
     try:
-        df    = get_klines(symbol, "1h", limit=50)
-        if df is None: return "NEUTRAL"
+        df = get_klines(symbol, "1h", limit=120)
+        if df is None or len(df) < 20: return "NEUTRAL"
+
         closes = df["close"]
         price  = closes.iloc[-1]
-        ema50  = closes.ewm(span=50, adjust=False, min_periods=20).mean().iloc[-1]
+        ema3   = closes.ewm(span=3,   adjust=False, min_periods=3).mean()
+        ema9   = closes.ewm(span=9,   adjust=False, min_periods=9).mean()
+        ema100 = closes.ewm(span=100, adjust=False, min_periods=20).mean()
+
+        ema3_now   = ema3.iloc[-1];   ema3_prev  = ema3.iloc[-2]
+        ema9_now   = ema9.iloc[-1];   ema9_prev  = ema9.iloc[-2]
+        ema100_now = ema100.iloc[-1]
+
         bull, bear = 0, 0
-        if price > ema50: bull += 1
-        else:             bear += 1
+
+        # ── Cruce EMA3/9 — señal de dirección ───────────────────────────────
+        cruce_alcista = ema3_prev <= ema9_prev and ema3_now > ema9_now
+        cruce_bajista = ema3_prev >= ema9_prev and ema3_now < ema9_now
+        if cruce_alcista:           bull += 3
+        elif cruce_bajista:         bear += 3
+        elif ema3_now > ema9_now:   bull += 2   # sin cruce pero EMA3 sobre EMA9
+        else:                       bear += 2
+
+        # ── EMA100 — tendencia de fondo ──────────────────────────────────────
+        if price > ema100_now:  bull += 2
+        else:                   bear += 2
+
+        # ── Estructura de swings HH/HL vs LH/LL ─────────────────────────────
         highs, lows = [], []
         for i in range(2, len(df) - 2):
             if df["high"].iloc[i] > df["high"].iloc[i-1] and df["high"].iloc[i] > df["high"].iloc[i+1]:
@@ -1049,15 +1080,15 @@ def get_1h_bias(symbol):
         if len(highs) >= 2 and len(lows) >= 2:
             if highs[-1] > highs[-2] and lows[-1] > lows[-2]:   bull += 2
             elif highs[-1] < highs[-2] and lows[-1] < lows[-2]: bear += 2
-            lc = df["close"].iloc[-1]
-            if lc > highs[-1]: bull += 1
-            if lc < lows[-1]:  bear += 1
+            # Precio rompiendo último swing — confirmación extra
+            if price > highs[-1]: bull += 1
+            if price < lows[-1]:  bear += 1
+
         if bull > bear:   return "BULLISH"
         elif bear > bull: return "BEARISH"
         return "NEUTRAL"
     except Exception as e:
         print("⚠️ Error en get_1h_bias: " + str(e))
-    except:
         return "NEUTRAL"
 
 
@@ -1455,12 +1486,14 @@ def clasificar_setup(direction, rsi, structure, divergence, htf_bias):
     return "SETUP"
 
 
-def calc_score(direction, rsi, ob, fvg, structure, patterns, vol_high, near_sr, divergence, htf_bias):
+def calc_score(direction, rsi, ob, fvg, structure, patterns, vol_high, near_sr, divergence, htf_bias,
+               ema_cruce_bull=False, ema_cruce_bear=False, ema_sobre_100=None):
     """
     Score de la señal (0-10). Tabla de puntos:
     OB: +2  |  FVG: +1.5  |  Estructura: +1.5  |  RSI extremo: +1.5
     Divergencia: +1.5  |  HTF a favor: +2  |  Vela: +1
     Volumen: +1  |  S/R clave: +1  |  HTF contra: -1
+    EMA3 cruza EMA9 a favor: +2  |  EMA3 sobre/bajo EMA9 a favor: +1  |  Precio sobre/bajo EMA100: +1
     Fibonacci y HH/LL se suman en analyze_symbol.
     """
     score, labels = 0, []
@@ -1477,7 +1510,12 @@ def calc_score(direction, rsi, ob, fvg, structure, patterns, vol_high, near_sr, 
         if divergence == "BULLISH_DIV":            score += 1.5; labels.append("Divergencia RSI alcista")
         if htf_bias == "BULLISH":                  score += 2;   labels.append("HTF a favor (ALCISTA)")
         elif htf_bias == "BEARISH":                score -= 1
-    else:
+        # ── EMAs ─────────────────────────────────────────────────────────────
+        if ema_cruce_bull:                         score += 2;   labels.append("⚡ Cruce EMA3 > EMA9 (alcista)")
+        if ema_sobre_100 is True:                  score += 1;   labels.append("Precio sobre EMA100")
+        elif ema_sobre_100 is False:               score -= 1    # tendencia contraria
+
+    else:  # SHORT
         if rsi >= RSI_OVERBOUGHT:                  score += 1.5; labels.append("RSI sobrecomprado (" + str(rsi) + ")")
         if ob:                                     score += 2;   labels.append("OB bajista " + fmt(ob["low"]) + "-" + fmt(ob["high"]))
         if fvg:                                    score += 1.5; labels.append("FVG bajista " + fmt(fvg["low"]) + "-" + fmt(fvg["high"]))
@@ -1487,6 +1525,10 @@ def calc_score(direction, rsi, ob, fvg, structure, patterns, vol_high, near_sr, 
         if divergence == "BEARISH_DIV":            score += 1.5; labels.append("Divergencia RSI bajista")
         if htf_bias == "BEARISH":                  score += 2;   labels.append("HTF a favor (BAJISTA)")
         elif htf_bias == "BULLISH":                score -= 1
+        # ── EMAs ─────────────────────────────────────────────────────────────
+        if ema_cruce_bear:                         score += 2;   labels.append("⚡ Cruce EMA3 < EMA9 (bajista)")
+        if ema_sobre_100 is False:                 score += 1;   labels.append("Precio bajo EMA100")
+        elif ema_sobre_100 is True:                score -= 1    # tendencia contraria
 
     if vol_high: score += 1; labels.append("Volumen elevado")
     if near_sr:  score += 1; labels.append("Precio en S/R clave")
@@ -1747,6 +1789,19 @@ def analyze_symbol(symbol, interval):
         htf_bias                 = get_htf_bias(symbol, interval)
         bias_1h                  = get_1h_bias(symbol) if interval == "15m" else None
         btc_momentum             = get_btc_momentum(interval) if symbol != "BTCUSDT" else "NEUTRAL"
+
+        # ── EMAs 3 / 9 / 100 en el timeframe de entrada ─────────────────────
+        _closes    = df["close"]
+        _ema3      = _closes.ewm(span=3,   adjust=False, min_periods=3).mean()
+        _ema9      = _closes.ewm(span=9,   adjust=False, min_periods=9).mean()
+        _ema100    = _closes.ewm(span=100, adjust=False, min_periods=20).mean()
+        ema3_now   = _ema3.iloc[-1];  ema3_prev  = _ema3.iloc[-2]
+        ema9_now   = _ema9.iloc[-1];  ema9_prev  = _ema9.iloc[-2]
+        ema100_now = _ema100.iloc[-1]
+        ema_cruce_bull = ema3_prev <= ema9_prev and ema3_now > ema9_now   # cruce alcista reciente
+        ema_cruce_bear = ema3_prev >= ema9_prev and ema3_now < ema9_now   # cruce bajista reciente
+        ema_sobre_100  = price > ema100_now                               # True = tendencia alcista
+
         fib_nivel, fib_desc, fib_dir = detect_fibonacci(df)
         hh_ll_type, hh_ll_level  = detect_hh_ll(df)
         near_sup                 = abs(price - sup) / price < 0.01
@@ -1818,7 +1873,8 @@ def analyze_symbol(symbol, interval):
                 if direction == "LONG"  and btc_momentum == "BEARISH": continue
 
             # 5. Score y clasificación
-            score, labels = calc_score(direction, rsi, ob, fvg, structure, candles, vol_h, near, divergence, htf_bias)
+            score, labels = calc_score(direction, rsi, ob, fvg, structure, candles, vol_h, near, divergence, htf_bias,
+                                       ema_cruce_bull, ema_cruce_bear, ema_sobre_100)
             tipo_setup    = clasificar_setup(direction, rsi, structure, divergence, htf_bias)
             if tipo_setup == "REBOTE": score = min(score, 5)
 
