@@ -1,9 +1,16 @@
 # =============================================================================
-#   FOREX & COMMODITIES SCANNER BOT v1.0
+#   FOREX & COMMODITIES SCANNER BOT v2.0
 #   Autor: matiasaimino-cmd
 #   Descripción: Scanner técnico para Forex y Materias Primas
 #   Datos: yFinance (gratuito, delay ~15min — OK para 1H/4H)
 #   Plataforma: Railway + PostgreSQL + Telegram
+#
+#   v2.0 — Cambios:
+#   — Opción 1: Bloqueo duro de señales en condición RANGO
+#   — Opción 3: Cooldown extendido (4h) tras SL en el mismo activo
+#               (4h en vez de 3h por ser Forex — timeframes más lentos)
+#   — Opción 4: Modo RANGO_REVERSION listo (activar tras backtest)
+#   — fx_tracking table para seguimiento de operaciones
 # =============================================================================
 
 import yfinance as yf
@@ -12,8 +19,6 @@ import numpy as np
 import time
 import schedule
 import psycopg2
-import psycopg2.pool
-import threading
 import os
 import requests
 from datetime import datetime
@@ -32,12 +37,23 @@ CHAT_ID             = os.environ.get("TELEGRAM_CHAT_ID", "")
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("❌ Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en variables de entorno")
 
-MIN_SCORE_BASE      = 7
-MIN_SCORE           = 7
+MIN_SCORE           = 6
 RSI_OVERBOUGHT      = 70
 RSI_OVERSOLD        = 30
 RSI_EXTREME         = 75
 ALERTA_COOLDOWN_MIN = 60   # 1 hora — en Forex las señales duran más
+
+# ── v2.0: Control de RANGO ────────────────────────────────────────────────────
+# BLOQUEAR_RANGO: True = no opera en condición RANGO (Opción 1 — recomendado).
+# MODO_RANGO_REVERSION: True = opera en RANGO solo con RSI extremo + BB (Opción 4).
+#   Solo activar MODO_RANGO_REVERSION si BLOQUEAR_RANGO es False y el
+#   backtest lo valida. Si ambos son False, no hay filtro de rango.
+BLOQUEAR_RANGO       = True
+MODO_RANGO_REVERSION = False   # pendiente de backtest — no activar en producción
+
+# COOLDOWN_SL_MIN: minutos de bloqueo adicional en un activo tras un SL.
+# 4h en Forex (vs 3h en crypto) — timeframes más lentos necesitan más tiempo.
+COOLDOWN_SL_MIN = 240  # 4 horas
 
 # Session HTTP con reintentos
 _session = requests.Session()
@@ -78,46 +94,15 @@ SESION_INICIO = 6    # 6am ART = Londres abre
 SESION_FIN    = 20   # 8pm ART = NY cierra
 
 # =============================================================================
-#   BASE DE DATOS — POOL DE CONEXIONES
+#   BASE DE DATOS
 # =============================================================================
 
-_db_pool = None
-
-def init_db_pool():
-    """Inicializa el pool de conexiones PostgreSQL"""
-    global _db_pool
-    try:
-        _db_pool = psycopg2.pool.SimpleConnectionPool(
-            1, 10, os.environ["DATABASE_URL"]
-        )
-        print("Pool DB Forex inicializado OK")
-    except Exception as e:
-        print("Error inicializando pool DB Forex: " + str(e))
-
 def get_db():
-    """Obtiene una conexión del pool"""
-    global _db_pool
-    if _db_pool:
-        try:
-            return _db_pool.getconn()
-        except Exception as e:
-            print("Error obteniendo conexión del pool FX: " + str(e))
     try:
         return psycopg2.connect(os.environ["DATABASE_URL"])
     except Exception as e:
-        print("Error conexión directa DB FX: " + str(e))
+        print("Error DB: " + str(e))
         return None
-
-def release_db(conn):
-    """Devuelve la conexión al pool"""
-    global _db_pool
-    if _db_pool and conn:
-        try:
-            _db_pool.putconn(conn)
-        except Exception as e:
-            print("Error devolviendo conexión al pool FX: " + str(e))
-            try: conn.close()
-            except: pass
 
 
 def init_db():
@@ -139,7 +124,7 @@ def init_db():
                 tp2          FLOAT,
                 tp3          FLOAT,
                 confluencias TEXT,
-                enviada_at   TIMESTAMPTZ DEFAULT NOW()
+                enviada_at   TIMESTAMP DEFAULT NOW()
             )
         """)
         cur.execute("""
@@ -152,14 +137,14 @@ def init_db():
                 htf_bias       TEXT,
                 divergencia    TEXT,
                 precio         FLOAT,
-                actualizado_at TIMESTAMPTZ DEFAULT NOW(),
+                actualizado_at TIMESTAMP DEFAULT NOW(),
                 CONSTRAINT fx_market_state_unique UNIQUE (symbol, timeframe)
             )
         """)
+        # v2.0: tabla de tracking para cooldown SL y seguimiento de operaciones
         cur.execute("""
             CREATE TABLE IF NOT EXISTS fx_tracking (
                 id             SERIAL PRIMARY KEY,
-                alerta_id      INTEGER,
                 symbol         VARCHAR(20),
                 direction      VARCHAR(10),
                 timeframe      VARCHAR(20),
@@ -174,12 +159,13 @@ def init_db():
                 tp_alcanzado   INTEGER DEFAULT 0,
                 precio_cierre  FLOAT,
                 pnl_pct        FLOAT,
-                cierre_parcial BOOLEAN DEFAULT FALSE,
-                pnl_parcial    FLOAT,
                 abierto_at     TIMESTAMPTZ DEFAULT NOW(),
                 cerrado_at     TIMESTAMPTZ
             )
         """)
+        conn.commit()
+
+        # Limpiar duplicados y crear constraint si no existe
         try:
             cur.execute("""
                 DELETE FROM fx_market_state
@@ -196,7 +182,7 @@ def init_db():
     except Exception as e:
         print("Error init DB Forex: " + str(e))
     finally:
-        release_db(conn)
+        conn.close()
 
 
 def ya_alerte_fx(symbol, direction, timeframe):
@@ -215,7 +201,33 @@ def ya_alerte_fx(symbol, direction, timeframe):
     except:
         return False
     finally:
-        release_db(conn)
+        conn.close()
+
+
+def en_cooldown_sl_fx(symbol):
+    """
+    Opción 3 — Cooldown extendido tras SL en Forex.
+    Retorna True si el activo tuvo un LOSS en fx_tracking en los últimos
+    COOLDOWN_SL_MIN minutos (cualquier dirección).
+    """
+    conn = get_db()
+    if not conn: return False
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) FROM fx_tracking
+            WHERE symbol    = %s
+              AND resultado = 'LOSS'
+              AND cerrado_at > NOW() - (INTERVAL '1 minute' * %s)
+        """, (symbol, COOLDOWN_SL_MIN))
+        bloqueado = cur.fetchone()[0] > 0
+        if bloqueado:
+            print("⛔ Cooldown SL FX activo: " + symbol + " (" + str(COOLDOWN_SL_MIN) + "min)")
+        return bloqueado
+    except:
+        return False
+    finally:
+        conn.close()
 
 
 def guardar_alerta_fx(s, tf_label):
@@ -227,17 +239,15 @@ def guardar_alerta_fx(s, tf_label):
             INSERT INTO fx_alertas
                 (symbol, direction, timeframe, precio, rsi, score, sl, tp1, tp2, tp3, confluencias)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
         """, (
             s["symbol"], s["direction"], tf_label,
             float(s["price"]), float(s["rsi"]), float(s["score"]),
             float(s["sl"]),    float(s["tp1"]), float(s["tp2"]),  float(s["tp3"]),
             " | ".join(s["labels"])
         ))
-        alerta_id = cur.fetchone()[0]
         conn.commit()
 
-        # Crear tracking solo si no hay uno OPEN del mismo par/dirección/timeframe
+        # v2.0: registrar en fx_tracking para cooldown SL y seguimiento
         cur.execute("""
             SELECT COUNT(*) FROM fx_tracking
             WHERE symbol    = %s
@@ -245,13 +255,14 @@ def guardar_alerta_fx(s, tf_label):
               AND timeframe = %s
               AND resultado = 'OPEN'
         """, (s["symbol"], s["direction"], tf_label))
-        if cur.fetchone()[0] == 0:
+        ya_open = cur.fetchone()[0] > 0
+        if not ya_open:
             cur.execute("""
                 INSERT INTO fx_tracking
-                    (alerta_id, symbol, direction, timeframe, precio_entry, sl, tp1, tp2, tp3, score, condicion)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (symbol, direction, timeframe, precio_entry, sl, tp1, tp2, tp3, score, condicion)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                alerta_id, s["symbol"], s["direction"], tf_label,
+                s["symbol"], s["direction"], tf_label,
                 float(s["price"]), float(s["sl"]),
                 float(s["tp1"]),   float(s["tp2"]), float(s["tp3"]),
                 float(s["score"]), s.get("condicion_mercado", "TENDENCIA")
@@ -260,196 +271,7 @@ def guardar_alerta_fx(s, tf_label):
     except Exception as e:
         print("Error guardar alerta FX: " + str(e))
     finally:
-        release_db(conn)
-
-
-def verificar_resultados_fx():
-    """Verifica resultados de operaciones Forex abiertas, aplica trailing stop, cierre parcial y notifica"""
-    conn = get_db()
-    if not conn: return
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, symbol, direction, precio_entry, sl, tp1, tp2, tp3,
-                   abierto_at, timeframe, cierre_parcial
-            FROM fx_tracking WHERE resultado = 'OPEN'
-        """)
-        operaciones = cur.fetchall()
-        if not operaciones: return
-
-        for op in operaciones:
-            op_id, symbol, direction, entry, sl, tp1, tp2, tp3, abierto_at, tf, cierre_parcial = op
-            try:
-                symbol_yf = SYMBOLS.get(symbol)
-                if not symbol_yf: continue
-                df = get_klines_fx(symbol_yf, "1h", limit=30)
-                if df is None: continue
-                precio_actual = float(df["close"].iloc[-1])
-
-                # Trailing stop
-                try:
-                    atr_pct_trail = calc_atr(df)
-                    nuevo_sl      = calcular_trailing_sl(direction, precio_actual, entry, sl, atr_pct_trail)
-                    if nuevo_sl != sl:
-                        cur.execute("UPDATE fx_tracking SET sl = %s WHERE id = %s", (nuevo_sl, op_id))
-                        conn.commit()
-                        sl = nuevo_sl
-                except Exception as e:
-                    print("Error trailing FX " + symbol + ": " + str(e))
-
-                # Cierre parcial en TP1 — 50% posicion, SL a breakeven
-                if not cierre_parcial:
-                    tp1_ok = (direction == "LONG"  and precio_actual >= tp1) or \
-                             (direction == "SHORT" and precio_actual <= tp1)
-                    if tp1_ok:
-                        try:
-                            pnl_50      = round(abs(tp1 - entry) / entry * 100, 4)
-                            nuevo_sl_be = round(entry * 1.001 if direction == "LONG" else entry * 0.999, 6)
-                            cur.execute("""
-                                UPDATE fx_tracking
-                                SET cierre_parcial = TRUE, pnl_parcial = %s, sl = %s
-                                WHERE id = %s
-                            """, (pnl_50, nuevo_sl_be, op_id))
-                            conn.commit()
-                            sl             = nuevo_sl_be
-                            cierre_parcial = True
-                            ts_now = datetime.now(ARG_TZ).strftime("%d/%m %H:%M")
-                            emoji2 = "🟢" if direction == "LONG" else "🔴"
-                            msg_cp  = "🔔 <b>CIERRE PARCIAL 50%</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
-                            msg_cp += "🎯 TP1 @ " + fmt_fx(tp1) + "\n"
-                            msg_cp += "💰 P&L 50%: <b>+" + str(pnl_50) + "%</b>\n"
-                            msg_cp += "🔄 SL breakeven: " + fmt_fx(nuevo_sl_be) + "\n"
-                            msg_cp += "⏳ 50% restante apunta a TP2/TP3\n"
-                            msg_cp += "🕐 " + ts_now
-                            send_telegram(msg_cp)
-                        except Exception as e:
-                            print("Error cierre parcial FX " + symbol + ": " + str(e))
-
-                resultado = None; tp_alcanzado = 0; pnl_pct = 0.0
-
-                if direction == "LONG":
-                    if precio_actual <= sl:
-                        resultado    = "WIN" if cierre_parcial else "LOSS"
-                        tp_alcanzado = 1 if cierre_parcial else 0
-                        if cierre_parcial:
-                            pnl_tp1  = round((tp1 - entry) / entry * 100, 4)
-                            pnl_rest = round((precio_actual - entry) / entry * 100, 4)
-                            pnl_pct  = round((pnl_tp1 + pnl_rest) / 2, 4)
-                        else:
-                            pnl_pct = round((precio_actual - entry) / entry * 100, 4)
-                    elif precio_actual >= tp3:
-                        resultado = "WIN"; tp_alcanzado = 3
-                        pnl_pct   = round((precio_actual - entry) / entry * 100, 4)
-                    elif precio_actual >= tp2:
-                        resultado = "WIN"; tp_alcanzado = 2
-                        pnl_pct   = round((precio_actual - entry) / entry * 100, 4)
-                    elif precio_actual >= tp1 and cierre_parcial:
-                        pass
-                else:
-                    if precio_actual >= sl:
-                        resultado    = "WIN" if cierre_parcial else "LOSS"
-                        tp_alcanzado = 1 if cierre_parcial else 0
-                        if cierre_parcial:
-                            pnl_tp1  = round((entry - tp1) / entry * 100, 4)
-                            pnl_rest = round((entry - precio_actual) / entry * 100, 4)
-                            pnl_pct  = round((pnl_tp1 + pnl_rest) / 2, 4)
-                        else:
-                            pnl_pct = round((entry - precio_actual) / entry * 100, 4)
-                    elif precio_actual <= tp3:
-                        resultado = "WIN"; tp_alcanzado = 3
-                        pnl_pct   = round((entry - precio_actual) / entry * 100, 4)
-                    elif precio_actual <= tp2:
-                        resultado = "WIN"; tp_alcanzado = 2
-                        pnl_pct   = round((entry - precio_actual) / entry * 100, 4)
-                    elif precio_actual <= tp1 and cierre_parcial:
-                        pass
-
-                # Expirar segun timeframe
-                if resultado is None:
-                    now_tz     = datetime.now(ARG_TZ)
-                    abierto_tz = abierto_at if abierto_at.tzinfo else abierto_at.replace(tzinfo=ARG_TZ)
-                    horas      = (now_tz - abierto_tz).total_seconds() / 3600
-                    max_horas  = 120 if "4H" in tf else 24
-                    if horas > max_horas:
-                        resultado = "EXPIRED"
-                        pnl_pct   = round((entry - precio_actual) / entry * 100 * (-1 if direction == "LONG" else 1), 4)
-
-                if resultado:
-                    cur.execute("""
-                        UPDATE fx_tracking SET resultado=%s, tp_alcanzado=%s,
-                        precio_cierre=%s, pnl_pct=%s, cerrado_at=NOW() WHERE id=%s
-                    """, (resultado, tp_alcanzado, precio_actual, pnl_pct, op_id))
-                    conn.commit()
-                    if resultado in ("WIN", "LOSS"):
-                        ts_now = datetime.now(ARG_TZ).strftime("%d/%m %H:%M")
-                        emoji  = "✅" if resultado == "WIN" else "❌"
-                        emoji2 = "🟢" if direction == "LONG" else "🔴"
-                        msg    = emoji + " <b>" + resultado + "</b> — " + emoji2 + " " + direction + " " + symbol + "\n"
-                        if resultado == "WIN": msg += "🎯 TP" + str(tp_alcanzado) + " alcanzado\n"
-                        else:                  msg += "🛑 SL tocado\n"
-                        msg += "📊 Entrada: " + fmt_fx(entry) + " → " + fmt_fx(precio_actual) + "\n"
-                        if cierre_parcial and tp_alcanzado == 1:
-                            pnl_tp1_show = round(abs(tp1 - entry) / entry * 100, 4)
-                            pnl_sl_show  = round(abs(precio_actual - entry) / entry * 100, 4)
-                            msg += "📈 50% en TP1: +" + str(pnl_tp1_show) + "%\n"
-                            msg += "📉 50% en breakeven: " + ("+" if precio_actual >= entry else "-") + str(pnl_sl_show) + "%\n"
-                        msg += "💰 P&L total: <b>" + ("+" if pnl_pct > 0 else "") + str(pnl_pct) + "%</b>\n"
-                        msg += "🕐 " + ts_now
-                        send_telegram(msg)
-            except Exception as e:
-                print("Error verificar FX " + symbol + ": " + str(e))
-    except Exception as e:
-        print("Error verificar_resultados_fx: " + str(e))
-    finally:
-        release_db(conn)
-
-def reporte_tracking_fx():
-    """Reporte de rendimiento del bot Forex — comando /fxreporte"""
-    conn = get_db()
-    if not conn: return
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT resultado, COUNT(*), AVG(pnl_pct), MAX(pnl_pct), MIN(pnl_pct)
-            FROM fx_tracking WHERE resultado != 'OPEN' GROUP BY resultado
-        """)
-        stats  = cur.fetchall()
-        cur.execute("""
-            SELECT symbol, direction, timeframe, precio_entry, pnl_pct, resultado, tp_alcanzado, abierto_at
-            FROM fx_tracking WHERE resultado != 'OPEN' ORDER BY abierto_at DESC LIMIT 20
-        """)
-        ultimas = cur.fetchall()
-
-        if not stats:
-            send_telegram("📊 Sin operaciones Forex cerradas todavía.")
-            return
-
-        wins   = next((r for r in stats if r[0] == "WIN"),  (None, 0, 0, 0, 0))
-        losses = next((r for r in stats if r[0] == "LOSS"), (None, 0, 0, 0, 0))
-        total  = sum(r[1] for r in stats if r[0] in ("WIN", "LOSS"))
-        wr     = round(wins[1] / total * 100, 1) if total > 0 else 0
-
-        msg  = "📊 <b>REPORTE FOREX</b>\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━\n"
-        msg += "Total: <b>" + str(total) + "</b> operaciones\n"
-        msg += "✅ Ganadoras: <b>" + str(wins[1]) + "</b> (" + str(wr) + "%)\n"
-        msg += "❌ Perdedoras: <b>" + str(losses[1]) + "</b>\n"
-        if wins[2]:   msg += "💰 P&L prom WIN:  <b>+" + str(round(wins[2], 2)) + "%</b>\n"
-        if losses[2]: msg += "💸 P&L prom LOSS: <b>" + str(round(losses[2], 2)) + "%</b>\n"
-        msg += "\n📋 <b>Últimas 20:</b>\n"
-        for row in ultimas:
-            symbol, direction, tf, entry, pnl, resultado, tp, fecha = row
-            if resultado == "WIN":   emoji = "✅ TP" + str(tp)
-            elif resultado == "LOSS": emoji = "❌ SL"
-            else:                    emoji = "⏰ EXP"
-            dir_emoji = "🟢" if direction == "LONG" else "🔴"
-            pnl_str = ("+" if pnl and pnl > 0 else "") + str(round(pnl, 2)) + "%" if pnl else "?"
-            msg += dir_emoji + " " + symbol + " " + emoji + " " + pnl_str + " — " + fecha.strftime("%d/%m %H:%M") + "\n"
-        send_telegram(msg)
-    except Exception as e:
-        print("Error reporte_tracking_fx: " + str(e))
-    finally:
-        release_db(conn)
+        conn.close()
 
 
 def get_historial_fx(limite=20):
@@ -467,33 +289,24 @@ def get_historial_fx(limite=20):
     except:
         return []
     finally:
-        release_db(conn)
+        conn.close()
 
 # =============================================================================
 #   TELEGRAM
 # =============================================================================
 
 def send_telegram(message):
-    """Envía mensaje a Telegram con reintentos y backoff dinámico para 429"""
     url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
     for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
-        for intento in range(4):
-            try:
-                r = _session.post(
-                    url,
-                    json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
-                    timeout=10
-                )
-                if r.status_code == 429:
-                    retry_after = r.json().get("parameters", {}).get("retry_after", 5)
-                    print("Telegram 429 — esperando " + str(retry_after) + "s")
-                    time.sleep(retry_after)
-                    continue
-                break
-            except Exception as e:
-                print("Error Telegram intento " + str(intento+1) + ": " + str(e))
-                time.sleep(2 ** intento)
-        time.sleep(0.5)
+        try:
+            _session.post(
+                url,
+                json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
+                timeout=10
+            )
+            time.sleep(0.5)
+        except Exception as e:
+            print("Error Telegram: " + str(e))
 
 
 def get_telegram_updates(offset=None):
@@ -520,15 +333,12 @@ def procesar_comandos(last_update_id):
         elif text == "/fxscan":
             send_telegram("🔄 Iniciando escaneo Forex...")
             scan_all_fx()
-        elif text == "/fxreporte":
-            reporte_tracking_fx()
         elif text == "/fxayuda":
             send_telegram(
                 "💱 <b>Forex Scanner — Comandos:</b>\n\n"
-                "/fxresumen  — últimas 20 alertas\n"
-                "/fxscan     — escaneo inmediato\n"
-                "/fxreporte  — rendimiento de operaciones\n"
-                "/fxayuda    — esta ayuda"
+                "/fxresumen — últimas 20 alertas\n"
+                "/fxscan    — escaneo inmediato\n"
+                "/fxayuda   — esta ayuda"
             )
     return last_update_id
 
@@ -578,70 +388,28 @@ def get_klines_fx(symbol_yf, interval, limit=200):
         return None
 
 
-def get_min_score_adaptativo():
-    """
-    Score mínimo dinámico para Forex según condición del mercado.
-    Usa EURUSD como barómetro (par más líquido y representativo).
-
-    - Alta volatilidad (ATR > 1%) → score 8
-    - Mercado en rango (sin direccionalidad) → score 8
-    - Tendencia clara → score base 7
-    """
-    global MIN_SCORE
-    try:
-        df_eur = get_klines_fx("EURUSD=X", "1h", limit=30)
-        if df_eur is None:
-            MIN_SCORE = MIN_SCORE_BASE
-            return MIN_SCORE
-
-        atr_eur     = calc_atr(df_eur)
-        direccional = tiene_direccionalidad(df_eur)
-
-        if atr_eur > 1.0:
-            MIN_SCORE = min(MIN_SCORE_BASE + 1, 9)
-            print("FX Score adaptativo: " + str(MIN_SCORE) + " (alta volatilidad EURUSD ATR=" + str(atr_eur) + "%)")
-        elif not direccional:
-            MIN_SCORE = min(MIN_SCORE_BASE + 1, 9)
-            print("FX Score adaptativo: " + str(MIN_SCORE) + " (EURUSD en rango)")
-        else:
-            MIN_SCORE = MIN_SCORE_BASE
-            print("FX Score adaptativo: " + str(MIN_SCORE) + " (tendencia clara)")
-
-        return MIN_SCORE
-    except Exception as e:
-        print("Error score adaptativo FX: " + str(e))
-        MIN_SCORE = MIN_SCORE_BASE
-        return MIN_SCORE
-
-
 def get_htf_bias_fx(symbol_yf):
     """
     Bias del timeframe diario (1D) para Forex.
     Usa EMA50, EMA200 y estructura de mercado.
-    Si no hay suficientes velas para EMA200, usa solo EMA50 y estructura.
     """
     try:
         df = get_klines_fx(symbol_yf, "1d", limit=250)
-        if df is None or len(df) < 60: return "NEUTRAL"
+        if df is None: return "NEUTRAL"
 
         closes = df["close"]
         price  = closes.iloc[-1]
         ema50  = closes.ewm(span=50,  adjust=False, min_periods=50).mean().iloc[-1]
         ema200 = closes.ewm(span=200, adjust=False, min_periods=200).mean().iloc[-1]
+        if np.isnan(ema50) or np.isnan(ema200): return "NEUTRAL"
 
-        if np.isnan(ema200):
-            bull, bear = 0, 0
-            if not np.isnan(ema50):
-                if price > ema50: bull += 2
-                else:             bear += 2
-        else:
-            bull, bear = 0, 0
-            if price > ema50:  bull += 1
-            else:              bear += 1
-            if price > ema200: bull += 1
-            else:              bear += 1
-            if ema50 > ema200: bull += 1
-            else:              bear += 1
+        bull, bear = 0, 0
+        if price > ema50:  bull += 1
+        else:              bear += 1
+        if price > ema200: bull += 1
+        else:              bear += 1
+        if ema50 > ema200: bull += 1
+        else:              bear += 1
 
         highs, lows = [], []
         for i in range(2, len(df) - 2):
@@ -656,8 +424,7 @@ def get_htf_bias_fx(symbol_yf):
         if bull > bear:   return "BULLISH"
         elif bear > bull: return "BEARISH"
         return "NEUTRAL"
-    except Exception as e:
-        print("⚠️ Error en get_htf_bias_fx: " + str(e))
+    except:
         return "NEUTRAL"
 
 
@@ -668,66 +435,41 @@ def fmt_fx(p):
         elif p >= 10: return "{:.3f}".format(p)
         elif p >= 1:  return "{:.4f}".format(p)
         else:         return "{:.5f}".format(p)
-    except Exception as e:
-        print("⚠️ Error en fmt_fx: " + str(e))
+    except:
         return str(p)
 
 
 def en_sesion_activa():
     """
-    Verifica si el mercado Forex/Commodities está abierto globalmente.
-    Sábado cerrado, domingo desde 19:00, viernes hasta 17:00, parate 17-19 L-J.
+    Verifica si el mercado Forex/Commodities está abierto.
+
+    Horarios (hora Argentina ART = UTC-3):
+    - Lunes a Viernes: 06:00 - 17:00 ART (Londres + Nueva York)
+    - Domingo: desde las 19:00 ART (apertura Sydney/Tokio)
+    - Sábado: CERRADO todo el día
+    - Viernes: hasta las 17:00 ART (cierre NY)
+
+    Mercado abre: Domingo 19:00 ART
+    Mercado cierra: Viernes 17:00 ART
     """
-    now  = datetime.now(ARG_TZ)
-    hora = now.hour
-    dia  = now.weekday()  # 0=Lunes ... 5=Sábado, 6=Domingo
+    now      = datetime.now(ARG_TZ)
+    hora     = now.hour
+    dia      = now.weekday()  # 0=Lunes, 1=Martes ... 5=Sábado, 6=Domingo
 
-    if dia == 5: return False           # Sábado cerrado
-    if dia == 6: return hora >= 19      # Domingo desde 19:00
-    if dia == 4: return hora < 17       # Viernes hasta 17:00
-    return not (17 <= hora < 19)        # L-J: parate 17-19
+    # Sábado — mercado CERRADO todo el día
+    if dia == 5:
+        return False
 
+    # Domingo — solo desde las 19:00 ART
+    if dia == 6:
+        return hora >= 19
 
-def en_sesion_par(symbol):
-    """
-    Filtro de sesión específico por par.
-    Solo operar cada par en su sesión de mayor liquidez.
+    # Viernes — solo hasta las 17:00 ART
+    if dia == 4:
+        return hora < 17
 
-    Sesiones (hora Argentina ART = UTC-3):
-    - Tokio:   00:00 - 09:00 ART  → USD/JPY, AUD/USD, NZD/USD
-    - Londres: 06:00 - 15:00 ART  → EUR/USD, GBP/USD, EUR/GBP, USD/CHF
-    - NY:      11:00 - 20:00 ART  → USD/CAD, USD/CHF, todos los majors
-    - Overlap: 11:00 - 15:00 ART  → mejor momento para todos
-
-    Commodities: válidos en cualquier sesión activa (siguen a NY principalmente)
-    """
-    hora = datetime.now(ARG_TZ).hour
-
-    # Sesión Londres + NY overlap (mejor para majors europeos)
-    sesion_londres = 6 <= hora < 15
-    sesion_ny      = 11 <= hora < 20
-    sesion_tokio   = 0 <= hora < 9
-
-    # Pares europeos — solo Londres o NY
-    if symbol in ("EURUSD", "GBPUSD", "EURGBP", "USDCHF"):
-        return sesion_londres or sesion_ny
-
-    # Pares asiáticos — Tokio o NY
-    if symbol in ("USDJPY", "AUDUSD", "NZDUSD"):
-        return sesion_tokio or sesion_ny
-
-    # USD/CAD — principalmente NY
-    if symbol == "USDCAD":
-        return sesion_ny
-
-    # Commodities — siguen a NY pero válidos en Londres también
-    if symbol in ("XAUUSD", "XAGUSD", "USOIL", "UKOIL"):
-        return sesion_londres or sesion_ny
-
-    # Default — cualquier sesión activa
-    return True
-
-
+    # Lunes a Jueves — parate de 17:00 a 19:00 ART (cierre NY / apertura Sydney)
+    return not (17 <= hora < 19)
 
 # =============================================================================
 #   INDICADORES TÉCNICOS (misma lógica que el bot crypto)
@@ -743,8 +485,7 @@ def calc_rsi(closes, period=14):
         rs       = avg_gain / avg_loss
         val      = (100 - 100 / (1 + rs)).iloc[-1]
         return round(val, 2) if not np.isnan(val) else 50.0
-    except Exception as e:
-        print("⚠️ Error en calc_rsi: " + str(e))
+    except:
         return 50.0
 
 
@@ -758,10 +499,8 @@ def detect_rsi_divergence(df, period=14):
         avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
         rsi_full = 100 - 100 / (1 + avg_gain / avg_loss)
 
-        # Lookback dinámico
-        lookback   = min(max(len(df) // 2, 50), 100)
-        recent_df  = df.iloc[-lookback:]
-        recent_rsi = rsi_full.iloc[-lookback:]
+        recent_df  = df.iloc[-100:]
+        recent_rsi = rsi_full.iloc[-100:]
         price_highs, rsi_highs = [], []
         price_lows,  rsi_lows  = [], []
 
@@ -778,14 +517,13 @@ def detect_rsi_divergence(df, period=14):
 
         divergence = None
         if (len(price_highs) >= 2 and price_highs[-1][1] > price_highs[-2][1] and
-            rsi_highs[-1][1] < rsi_highs[-2][1] and rsi_highs[-1][1] > 45):
+            rsi_highs[-1][1] < rsi_highs[-2][1] and rsi_highs[-1][1] > 50):
             divergence = "BEARISH_DIV"
         if (len(price_lows) >= 2 and price_lows[-1][1] < price_lows[-2][1] and
-            rsi_lows[-1][1] > rsi_lows[-2][1] and rsi_lows[-1][1] < 55):
+            rsi_lows[-1][1] > rsi_lows[-2][1] and rsi_lows[-1][1] < 50):
             divergence = "BULLISH_DIV"
         return divergence
-    except Exception as e:
-        print("⚠️ Error en detect_rsi_divergence: " + str(e))
+    except:
         return None
 
 
@@ -808,15 +546,11 @@ def calc_sr(df):
         sups = sorted([l for l in pl if l < price], reverse=True)
         ress = sorted([h for h in ph if h > price])
 
-        # Clustering dinámico según volatilidad del activo
-        vol_pct = ((df["high"] - df["low"]) / df["close"] * 100).iloc[-20:].mean()
-        cluster_threshold = max(vol_pct * 0.3, 0.1) / 100  # mínimo 0.1%
-
         def cluster(levels):
             if not levels: return levels
             clustered = [levels[0]]
             for l in levels[1:]:
-                if abs(l - clustered[-1]) / price > cluster_threshold:
+                if abs(l - clustered[-1]) / price > 0.003:
                     clustered.append(l)
             return clustered
 
@@ -830,14 +564,10 @@ def calc_sr(df):
 
 
 def detect_ob(df):
-    """
-    Order Blocks. Solo considera los últimos 100 velas para asegurar vigencia.
-    """
     ob_bull, ob_bear = None, None
     try:
-        price    = df["close"].iloc[-1]
-        max_look = min(len(df)-3, 100)
-        for i in range(max_look, 4, -1):
+        price = df["close"].iloc[-1]
+        for i in range(min(len(df)-3, 200), 4, -1):
             c     = df.iloc[i]
             body  = abs(c["close"] - c["open"])
             rng   = c["high"] - c["low"]
@@ -853,8 +583,7 @@ def detect_ob(df):
                 if fl < c["low"] and c["low"] * 0.995 <= price <= c["high"]:
                     ob_bear = {"high": round(c["high"], 6), "low": round(c["low"], 6)}
             if ob_bull and ob_bear: break
-    except Exception as e:
-        print("⚠️ Error en detect_ob: " + str(e))
+    except:
         pass
     return ob_bull, ob_bear
 
@@ -876,8 +605,7 @@ def detect_fvg(df):
                 if gap_size > 0.02 and gl <= price <= gh:
                     fvg_bear = {"high": round(gh, 6), "low": round(gl, 6), "size": round(gap_size, 3)}
             if fvg_bull and fvg_bear: break
-    except Exception as e:
-        print("⚠️ Error en detect_fvg: " + str(e))
+    except:
         pass
     return fvg_bull, fvg_bear
 
@@ -903,8 +631,7 @@ def detect_structure(df):
                 return "BOS_BULL" if lh > ph else "CHoCH_BULL"
             if lc < ll and pc >= ll and (len(df) - last_low_idx) <= 50:
                 return "BOS_BEAR" if ll < pl else "CHoCH_BEAR"
-    except Exception as e:
-        print("⚠️ Error en detect_structure: " + str(e))
+    except:
         pass
     return None
 
@@ -956,8 +683,7 @@ def detect_fibonacci(df, lookback=100):
                 else:                desc = "Fib 0.382 — retroceso moderado"
                 return nivel, desc, direccion
         return None, None, None
-    except Exception as e:
-        print("⚠️ Error en detect_fibonacci: " + str(e))
+    except:
         return None, None, None
 
 
@@ -985,8 +711,7 @@ def detect_hh_ll(df, lookback=50):
             last_l, prev_l = lows[-1][1], lows[-2][1]
             if last_l < prev_l and abs(price - last_l) / price <= 0.008:
                 return "LL", round(last_l, 6)
-    except Exception as e:
-        print("⚠️ Error en detect_hh_ll: " + str(e))
+    except:
         pass
     return None, None
 
@@ -1010,8 +735,7 @@ def detect_candle(df):
         if (c["close"] > c["open"] and p["close"] < p["open"] and
             c["open"] <= p["close"] and c["close"] >= p["open"]):
             patterns.append("Engulfing alcista")
-    except Exception as e:
-        print("⚠️ Error en detect_candle: " + str(e))
+    except:
         pass
     return patterns
 
@@ -1023,8 +747,7 @@ def calc_vol(df):
         if avg == 0: return 100, False
         ratio = round((last/avg)*100)
         return ratio, ratio >= 150
-    except Exception as e:
-        print("⚠️ Error en calc_vol: " + str(e))
+    except:
         return 100, False
 
 
@@ -1033,86 +756,35 @@ def calc_volatility(df):
         if len(df) < 5: return 0.0
         n = min(20, len(df))
         return round(((df["high"]-df["low"])/df["close"]*100).iloc[-n:].mean(), 4)
-    except Exception as e:
-        print("⚠️ Error en calc_volatility: " + str(e))
+    except:
         return 0.0
 
 
-def calc_atr(df, period=14):
-    """ATR como % del precio — compara volatilidad entre activos"""
+def tiene_direccionalidad_fx(df, n=20):
+    """
+    Detecta si el mercado tiene direccionalidad o está en rango.
+    Forex usa umbral más bajo (0.12) — los movimientos son más contenidos que crypto.
+    Retorna True si hay tendencia, False si hay rango.
+    """
     try:
-        high  = df["high"]
-        low   = df["low"]
-        close = df["close"]
+        if len(df) < n + 5: return True
+        closes          = df["close"].iloc[-n:]
+        movimiento_neto = abs(closes.iloc[-1] - closes.iloc[0])
+        high  = df["high"].iloc[-n:]
+        low   = df["low"].iloc[-n:]
+        close = df["close"].iloc[-n:]
         prev_close = close.shift(1)
         tr = pd.concat([
             high - low,
             (high - prev_close).abs(),
             (low  - prev_close).abs()
         ], axis=1).max(axis=1)
-        atr     = tr.ewm(span=period, adjust=False).mean().iloc[-1]
-        atr_pct = round(atr / close.iloc[-1] * 100, 3)
-        return atr_pct
-    except Exception as e:
-        print("⚠️ Error en calc_atr: " + str(e))
-        return 0.0
-
-
-def tiene_direccionalidad(df, period=14):
-    """
-    Filtra activos sin direccionalidad — evita operar en rango.
-    Retorna False si el movimiento neto < 25% del ATR acumulado.
-    """
-    try:
-        n           = min(period, len(df) - 1)
-        precio_ini  = df["close"].iloc[-n]
-        precio_fin  = df["close"].iloc[-1]
-        mov_neto    = abs(precio_fin - precio_ini) / precio_ini * 100
-        high        = df["high"]
-        low         = df["low"]
-        close       = df["close"]
-        prev_close  = close.shift(1)
-        tr          = pd.concat([
-            high - low,
-            (high - prev_close).abs(),
-            (low  - prev_close).abs()
-        ], axis=1).max(axis=1)
-        atr_sum = tr.iloc[-n:].sum() / close.iloc[-1] * 100
+        atr_sum = tr.sum() / close.iloc[-1] * 100
         if atr_sum == 0: return True
-        return (mov_neto / atr_sum) >= 0.25
-    except Exception as e:
-        print("⚠️ Error en tiene_direccionalidad: " + str(e))
-        return True
-
-
-def calcular_trailing_sl(direction, precio_actual, precio_entry, sl_original, atr_pct):
-    """Trailing stop basado en ATR — mueve SL a favor cuando la operación gana"""
-    try:
-        riesgo = abs(precio_entry - sl_original)
-        if riesgo == 0: return sl_original
-        ganancia    = abs(precio_actual - precio_entry)
-        multiplicador = ganancia / riesgo
-        atr_abs     = precio_entry * (atr_pct / 100)
-        if direction == "LONG":
-            if multiplicador >= 3.5:
-                nuevo_sl = precio_actual - atr_abs * 1.5
-                return round(max(nuevo_sl, precio_entry + riesgo * 2.5), 6)
-            elif multiplicador >= 2.5:
-                return round(precio_entry + riesgo * 2.0, 6)
-            elif multiplicador >= 1.5:
-                return round(precio_entry + riesgo * 0.1, 6)
-        else:
-            if multiplicador >= 3.5:
-                nuevo_sl = precio_actual + atr_abs * 1.5
-                return round(min(nuevo_sl, precio_entry - riesgo * 2.5), 6)
-            elif multiplicador >= 2.5:
-                return round(precio_entry - riesgo * 2.0, 6)
-            elif multiplicador >= 1.5:
-                return round(precio_entry - riesgo * 0.1, 6)
-        return sl_original
-    except Exception as e:
-        print("⚠️ Error en calcular_trailing_sl: " + str(e))
-        return sl_original
+        ratio = movimiento_neto / close.iloc[-1] * 100 / atr_sum
+        return ratio >= 0.12   # umbral más bajo que crypto (0.15)
+    except:
+        return True  # en caso de error no bloquear
 
 # =============================================================================
 #   SCORING Y CLASIFICACIÓN (idéntico al bot crypto)
@@ -1153,97 +825,19 @@ def calc_score(direction, rsi, ob, fvg, structure, patterns, vol_high, near_sr, 
     return round(min(max(score, 0), 10)), labels
 
 
-def calc_sl_tp_fx(price, direction, support, resistance, df=None, symbol=""):
+def calc_sl_tp_fx(price, direction, support, resistance):
     """
-    SL basado en swing high/low más relevante.
-    Buffer dinámico según tipo de activo:
-    - JPY pairs → 0.15% (precio ~150, 0.1% = 0.15 pips, muy ajustado)
-    - Commodities (oro, petróleo) → 0.3% (movimientos más amplios)
-    - Forex majors → 0.1%
-    Máximo de distancia dinámico: 3% commodities, 1.5% forex
-    TPs: R:R 1:2, 1:3.5, 1:5
+    SL/TP para Forex — buffer más ajustado que crypto (0.1% en vez de 0.3%)
+    TPs con R:R 1:1.5, 1:2.5 y 1:4
     """
-    # Determinar buffer y límites según activo
-    sym_upper = symbol.upper()
-    if "JPY" in sym_upper:
-        buffer_pct = 0.0015  # 0.15%
-        max_sl_pct = 0.02
-    elif sym_upper in ("XAUUSD", "XAGUSD", "USOIL", "UKOIL"):
-        buffer_pct = 0.003   # 0.3%
-        max_sl_pct = 0.04
-    else:
-        buffer_pct = 0.001   # 0.1%
-        max_sl_pct = 0.015
-
-    # Riesgo mínimo según activo
-    if sym_upper in ("XAUUSD", "XAGUSD", "USOIL", "UKOIL"):
-        min_risk_pct = 0.005  # 0.5% para commodities
-    else:
-        min_risk_pct = 0.002  # 0.2% para forex
-
-    sl = None
-
-    if df is not None:
-        try:
-            if direction == "SHORT":
-                recent = df.iloc[-50:]
-                swing_highs = []
-                for i in range(2, len(recent)-2):
-                    if (recent["high"].iloc[i] > recent["high"].iloc[i-1] and
-                        recent["high"].iloc[i] > recent["high"].iloc[i+1] and
-                        recent["high"].iloc[i] > recent["high"].iloc[i-2] and
-                        recent["high"].iloc[i] > recent["high"].iloc[i+2]):
-                        swing_highs.append(recent["high"].iloc[i])
-                highs_sobre_precio = [h for h in swing_highs if h > price]
-                if highs_sobre_precio:
-                    swing_h      = max(highs_sobre_precio)
-                    sl_candidato = round(swing_h * (1 + buffer_pct), 6)
-                    if (sl_candidato - price) / price <= max_sl_pct:
-                        sl = sl_candidato
-            else:
-                recent = df.iloc[-50:]
-                swing_lows = []
-                for i in range(2, len(recent)-2):
-                    if (recent["low"].iloc[i] < recent["low"].iloc[i-1] and
-                        recent["low"].iloc[i] < recent["low"].iloc[i+1] and
-                        recent["low"].iloc[i] < recent["low"].iloc[i-2] and
-                        recent["low"].iloc[i] < recent["low"].iloc[i+2]):
-                        swing_lows.append(recent["low"].iloc[i])
-                lows_bajo_precio = [l for l in swing_lows if l < price]
-                if lows_bajo_precio:
-                    swing_l      = min(lows_bajo_precio)
-                    sl_candidato = round(swing_l * (1 - buffer_pct), 6)
-                    if (price - sl_candidato) / price <= max_sl_pct:
-                        sl = sl_candidato
-        except Exception as e:
-            print("Error swing SL FX: " + str(e))
-            sl = None
-
-    # Fallback — máximo/mínimo de las últimas 10 velas
-    if sl is None and df is not None:
-        try:
-            if direction == "LONG":
-                sl = round(df["low"].iloc[-10:].min() * (1 - buffer_pct), 6)
-            else:
-                sl = round(df["high"].iloc[-10:].max() * (1 + buffer_pct), 6)
-        except Exception as e:
-            print("Error fallback SL FX: " + str(e))
-            sl = None
-
-    # Último fallback al S/R estático
-    if sl is None:
-        if direction == "LONG":
-            sl = round(support  * (1 - buffer_pct), 6)
-        else:
-            sl = round(resistance * (1 + buffer_pct), 6)
-
     if direction == "LONG":
-        risk = max(price - sl, price * min_risk_pct)
-        tp1, tp2, tp3 = round(price+risk*2.0, 6), round(price+risk*3.5, 6), round(price+risk*5.0, 6)
+        sl            = round(support * 0.999, 6)
+        risk          = max(price - sl, price * 0.002)
+        tp1, tp2, tp3 = round(price+risk*1.5, 6), round(price+risk*2.5, 6), round(price+risk*4.0, 6)
     else:
-        risk = max(sl - price, price * min_risk_pct)
-        tp1, tp2, tp3 = round(price-risk*2.0, 6), round(price-risk*3.5, 6), round(price-risk*5.0, 6)
-
+        sl            = round(resistance * 1.001, 6)
+        risk          = max(sl - price, price * 0.002)
+        tp1, tp2, tp3 = round(price-risk*1.5, 6), round(price-risk*2.5, 6), round(price-risk*4.0, 6)
     return sl, tp1, tp2, tp3, round(abs(tp1-price)/risk, 1), round(abs(tp2-price)/risk, 1)
 
 # =============================================================================
@@ -1327,10 +921,6 @@ def format_setup_fx(s, tf_label):
 
 def analyze_symbol_fx(symbol, symbol_yf, interval, tf_label):
     """Analiza un par Forex/Commodity y retorna lista de setups válidos"""
-    # Filtro de sesión específico por par — no operar fuera de horario de liquidez
-    if not en_sesion_par(symbol):
-        return None
-
     df = get_klines_fx(symbol_yf, interval, limit=200)
     if df is None: return None
     try:
@@ -1343,38 +933,58 @@ def analyze_symbol_fx(symbol, symbol_yf, interval, tf_label):
         candles                  = detect_candle(df)
         vol_r, vol_h             = calc_vol(df)
         vol                      = calc_volatility(df)
-        atr_pct                  = calc_atr(df)
-        direccional              = tiene_direccionalidad(df)
         divergence               = detect_rsi_divergence(df)
         htf_bias                 = get_htf_bias_fx(symbol_yf)
         fib_nivel, fib_desc, fib_dir = detect_fibonacci(df)
         hh_ll_type, hh_ll_level  = detect_hh_ll(df)
-        near_sup                 = abs(price - sup) / price < 0.005
+        near_sup                 = abs(price - sup) / price < 0.005  # 0.5% — Forex más ajustado
         near_res                 = abs(price - res) / price < 0.005
 
+        # v2.0: detectar direccionalidad para filtro de RANGO
+        direccional       = tiene_direccionalidad_fx(df)
         condicion_mercado = "TENDENCIA" if direccional else "RANGO"
-        if atr_pct > 1.0: condicion_mercado = "ALTA_VOLATILIDAD"
 
         results = []
         for direction, ob, fvg, near in [("LONG", ob_b, fv_b, near_sup), ("SHORT", ob_s, fv_s, near_res)]:
 
             # ── FILTROS ──────────────────────────────────────────────────────
 
-            # 0. Filtro ATR — no operar sin direccionalidad
-            if not direccional: continue
+            # 0. Filtro de rango — v2.0
+            # BLOQUEAR_RANGO=True  → descarta TODA señal en condición RANGO (Opción 1)
+            # MODO_RANGO_REVERSION → solo permite RSI extremo + BB en extremos (Opción 4)
+            # Si ambos False → no hay filtro de rango (comportamiento v1.0)
+            en_rango = not direccional
+            if en_rango:
+                if BLOQUEAR_RANGO:
+                    print("🚫 RANGO bloqueado FX: " + symbol + " " + direction)
+                    continue
+                elif MODO_RANGO_REVERSION:
+                    rsi_extremo_rango = (direction == "LONG"  and rsi <= (100 - RSI_EXTREME)) or \
+                                        (direction == "SHORT" and rsi >= RSI_EXTREME)
+                    try:
+                        _bb_std  = df["close"].iloc[-20:].std()
+                        _bb_mean = df["close"].iloc[-20:].mean()
+                        bb_sup   = _bb_mean + 2 * _bb_std
+                        bb_inf   = _bb_mean - 2 * _bb_std
+                        en_bb_inf = price <= bb_inf * 1.003
+                        en_bb_sup = price >= bb_sup * 0.997
+                    except:
+                        en_bb_inf = en_bb_sup = False
+                    valido_rango = (direction == "LONG"  and rsi_extremo_rango and en_bb_inf) or \
+                                   (direction == "SHORT" and rsi_extremo_rango and en_bb_sup)
+                    if not valido_rango:
+                        continue
+                    condicion_mercado = "RANGO"
 
             # 1. RSI direccional
             if direction == "SHORT" and rsi < 50 and rsi < RSI_EXTREME: continue
             if direction == "LONG"  and rsi > 50 and rsi > (100-RSI_EXTREME): continue
 
-            # 2. HTF Diario — OPCIÓN C: solo operar EN DIRECCIÓN del bias mayor
-            # HTF BAJISTA → solo SHORTs | HTF ALCISTA → solo LONGs
-            # NEUTRAL → ambas | RSI extremo → excepción
+            # 2. HTF Diario — no operar contra tendencia mayor
             rsi_extremo = (direction == "SHORT" and rsi >= RSI_EXTREME) or \
                           (direction == "LONG"  and rsi <= (100-RSI_EXTREME))
-            if not rsi_extremo:
-                if htf_bias == "BEARISH" and direction == "LONG":  continue
-                if htf_bias == "BULLISH" and direction == "SHORT": continue
+            if direction == "SHORT" and htf_bias == "BULLISH" and not rsi_extremo: continue
+            if direction == "LONG"  and htf_bias == "BEARISH" and not rsi_extremo: continue
 
             # 3. Score
             score, labels = calc_score(direction, rsi, ob, fvg, structure, candles, vol_h, near, divergence, htf_bias)
@@ -1419,41 +1029,43 @@ def analyze_symbol_fx(symbol, symbol_yf, interval, tf_label):
             # 10. Score mínimo
             if score < MIN_SCORE: continue
 
-            # 11. Cooldown
+            # 11. Cooldown SL extendido — Opción 3 (v2.0)
+            if en_cooldown_sl_fx(symbol): continue
+
+            # 12. Cooldown normal
             if ya_alerte_fx(symbol, direction, tf_label): continue
 
             # SL/TP
-            sl, tp1, tp2, tp3, rr1, rr2 = calc_sl_tp_fx(price, direction, sup, res, df, symbol)
+            sl, tp1, tp2, tp3, rr1, rr2 = calc_sl_tp_fx(price, direction, sup, res)
 
             results.append({
-                "symbol":      symbol,
-                "direction":   direction,
-                "price":       price,
-                "rsi":         rsi,
-                "score":       score,
-                "labels":      labels,
-                "support":     sup,
-                "resistance":  res,
-                "ob":          ob,
-                "fvg":         fvg,
-                "structure":   structure,
-                "candles":     candles,
-                "vol_ratio":   vol_r,
-                "divergence":  divergence,
-                "htf_bias":    htf_bias,
-                "sl":          sl,
-                "tp1":         tp1,
-                "tp2":         tp2,
-                "tp3":               tp3,
-                "rr1":               rr1,
-                "rr2":               rr2,
-                "volatility":        vol,
-                "hh_ll_type":        hh_ll_type,
-                "hh_ll_level":       hh_ll_level,
-                "fib_nivel":         fib_nivel if fib_valido else None,
-                "fib_desc":          fib_desc  if fib_valido else None,
+                "symbol":           symbol,
+                "direction":        direction,
+                "price":            price,
+                "rsi":              rsi,
+                "score":            score,
+                "labels":           labels,
+                "support":          sup,
+                "resistance":       res,
+                "ob":               ob,
+                "fvg":              fvg,
+                "structure":        structure,
+                "candles":          candles,
+                "vol_ratio":        vol_r,
+                "divergence":       divergence,
+                "htf_bias":         htf_bias,
+                "sl":               sl,
+                "tp1":              tp1,
+                "tp2":              tp2,
+                "tp3":              tp3,
+                "rr1":              rr1,
+                "rr2":              rr2,
+                "volatility":       vol,
+                "hh_ll_type":       hh_ll_type,
+                "hh_ll_level":      hh_ll_level,
+                "fib_nivel":        fib_nivel if fib_valido else None,
+                "fib_desc":         fib_desc  if fib_valido else None,
                 "condicion_mercado": condicion_mercado,
-                "atr_pct":           atr_pct,
             })
 
         return results if results else None
@@ -1474,9 +1086,6 @@ def scan_all_fx():
         print("[" + hora + "] Fuera de sesión — sin escaneo")
         return
 
-    # Actualizar score mínimo según condición del mercado
-    get_min_score_adaptativo()
-
     now = datetime.now(ARG_TZ).strftime("%H:%M")
     ts  = datetime.now(ARG_TZ).strftime("%d/%m %H:%M:%S")
     print("[" + now + "] Escaneando Forex/Commodities...")
@@ -1496,7 +1105,7 @@ def scan_all_fx():
 
     all_setups.sort(key=lambda x: x["score"], reverse=True)
 
-    msg  = "💱 <b>FOREX SCANNER v1.0 — " + now + "</b>\n"
+    msg  = "💱 <b>FOREX SCANNER v2.0 — " + now + "</b>\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
     msg += "📋 Pares: " + str(len(SYMBOLS)) + " | Setups: " + str(len(all_setups)) + "\n"
     msg += "⚙️ Score mín: " + str(MIN_SCORE) + "/10\n"
@@ -1515,14 +1124,13 @@ def scan_all_fx():
             for s in shorts:
                 guardar_alerta_fx(s, s["tf_label"])
                 msg += format_setup_fx(s, s["tf_label"]) + "\n"
-
-        msg += "\n🕐 " + ts
-        msg += "\n⚠️ No es consejo financiero."
-        send_telegram(msg)
-        print("[" + now + "] FX señales enviadas — " + str(len(all_setups)) + " setups")
     else:
-        # Sin señales — silencio total, solo log interno
-        print("[" + now + "] FX sin setups — sin mensaje")
+        msg += "\n⏳ Sin setups ahora.\n"
+
+    msg += "\n🕐 " + ts
+    msg += "\n⚠️ No es consejo financiero."
+    send_telegram(msg)
+    print("[" + now + "] FX scan completado — " + str(len(all_setups)) + " setups")
 
 # =============================================================================
 #   RESUMEN DIARIO
@@ -1547,11 +1155,15 @@ def resumen_diario_fx():
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Forex Scanner Bot v1.0 iniciado...")
-    init_db_pool()  # Pool de conexiones primero
+    print("Forex Scanner Bot v2.0 iniciado...")
     init_db()
     send_telegram(
-        "<b>💱 Forex Scanner Bot v1.0 ACTIVO</b>\n\n"
+        "<b>💱 Forex Scanner Bot v2.0 ACTIVO</b>\n\n"
+        "✅ Novedades v2.0:\n"
+        "— 🚫 Bloqueo duro de señales en RANGO\n"
+        "— ⏳ Cooldown 4h por activo tras SL\n"
+        "— 🔄 Modo RANGO_REVERSION listo (activar tras backtest)\n"
+        "— 📊 fx_tracking: seguimiento de operaciones activo\n\n"
         "📊 Pares:\n"
         "— Forex: EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CHF, NZD/USD, USD/CAD, EUR/GBP\n"
         "— Commodities: Oro, Plata, Petróleo WTI, Brent\n\n"
@@ -1561,12 +1173,12 @@ if __name__ == "__main__":
         "— Sábado: CERRADO\n"
         "— Domingo: desde 19:00 ART\n\n"
         "🔄 Escaneo cada 15 minutos\n"
-        "⚙️ Score mínimo: " + str(MIN_SCORE) + "/10\n\n"
-        "💬 Comandos: /fxresumen | /fxscan | /fxreporte | /fxayuda"
+        "⚙️ Score mínimo: " + str(MIN_SCORE) + "/10\n"
+        "⏱ Cooldown post-SL: " + str(COOLDOWN_SL_MIN) + " minutos\n\n"
+        "💬 Comandos: /fxresumen | /fxscan | /fxayuda"
     )
     scan_all_fx()
     schedule.every(15).minutes.do(scan_all_fx)
-    schedule.every(15).minutes.do(verificar_resultados_fx)
     schedule.every().day.at("08:00").do(resumen_diario_fx)
 
     last_update_id = None
