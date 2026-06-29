@@ -1,8 +1,14 @@
 # =============================================================================
-#   CRYPTO SCANNER BOT v4.5
+#   CRYPTO SCANNER BOT v5.0
 #   Autor: matiasaimino-cmd
 #   Descripción: Scanner de crypto con análisis técnico automatizado
 #   Plataforma: Railway + PostgreSQL + Telegram
+#
+#   v5.0 — Cambios:
+#   — Opción 1: Bloqueo duro de señales en condición RANGO
+#   — Opción 3: Cooldown extendido (3h) tras SL en el mismo activo
+#   — Opción 4: Modo RANGO_REVERSION (desactivado por defecto, activar con
+#               MODO_RANGO_REVERSION = True cuando esté validado en backtest)
 # =============================================================================
 
 import requests
@@ -38,6 +44,18 @@ RSI_OVERBOUGHT      = 70
 RSI_OVERSOLD        = 30
 RSI_EXTREME         = 75
 ALERTA_COOLDOWN_MIN = 30
+
+# ── v5.0: Control de RANGO ────────────────────────────────────────────────────
+# BLOQUEAR_RANGO: True = no opera en condición RANGO (recomendado).
+# MODO_RANGO_REVERSION: True = opera en RANGO solo con RSI extremo + BB.
+#   Solo activar MODO_RANGO_REVERSION si BLOQUEAR_RANGO es False y el
+#   backtest lo valida. Si ambos son False se restaura comportamiento v4.5.
+BLOQUEAR_RANGO        = True
+MODO_RANGO_REVERSION  = False   # pendiente de backtest — no activar en producción
+
+# COOLDOWN_SL_MIN: minutos de bloqueo adicional en un activo tras un SL.
+# Opera sobre el activo completo (ambas direcciones) para cortar rachas de chop.
+COOLDOWN_SL_MIN = 180  # 3 horas
 
 # Session HTTP con reintentos automáticos
 _session = requests.Session()
@@ -250,6 +268,32 @@ def ya_alerte(symbol, direction, timeframe):
               AND enviada_at > NOW() - (INTERVAL '1 minute' * %s)
         """, (symbol, direction, timeframe, ALERTA_COOLDOWN_MIN))
         return cur.fetchone()[0] > 0
+    except:
+        return False
+    finally:
+        release_db(conn)
+
+
+def en_cooldown_sl(symbol):
+    """
+    Opción 3 — Cooldown extendido tras SL.
+    Retorna True si el activo tuvo un SL en los últimos COOLDOWN_SL_MIN minutos
+    (cualquier dirección). Bloquea nuevas entradas para cortar rachas de chop.
+    """
+    conn = get_db()
+    if not conn: return False
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) FROM tracking
+            WHERE symbol    = %s
+              AND resultado = 'LOSS'
+              AND cerrado_at > NOW() - (INTERVAL '1 minute' * %s)
+        """, (symbol, COOLDOWN_SL_MIN))
+        bloqueado = cur.fetchone()[0] > 0
+        if bloqueado:
+            print("⛔ Cooldown SL activo: " + symbol + " (" + str(COOLDOWN_SL_MIN) + "min)")
+        return bloqueado
     except:
         return False
     finally:
@@ -1813,20 +1857,41 @@ def analyze_symbol(symbol, interval):
 
             # ── FILTROS DE ENTRADA ───────────────────────────────────────────
 
-            # 0. Filtro de rango — v4.5
-            # En tendencia: opera normalmente en dirección del bias.
-            # En rango: solo permite entradas en los EXTREMOS del rango
-            #   → LONG cerca del soporte (parte baja) — precio dentro del 1.5% del sup
-            #   → SHORT cerca de la resistencia (parte alta) — precio dentro del 1.5% del res
-            # El medio del rango se descarta (demasiado ruido).
+            # 0. Filtro de rango — v5.0
+            # BLOQUEAR_RANGO=True  → descarta TODA señal en condición RANGO (Opción 1)
+            # MODO_RANGO_REVERSION → solo permite RSI extremo + BB en extremos (Opción 4)
+            # Si ambos False → comportamiento v4.5 (solo extremos S/R al 1.5%)
             en_rango = not direccional
             if en_rango:
-                cerca_soporte    = abs(price - sup) / price <= 0.015
-                cerca_resistencia = abs(price - res) / price <= 0.015
-                if direction == "LONG"  and not cerca_soporte:    continue
-                if direction == "SHORT" and not cerca_resistencia: continue
-                # Etiquetar condición para el mensaje y DB
-                condicion_mercado = "RANGO"
+                if BLOQUEAR_RANGO:
+                    # Opción 1: bloqueo duro — no operar en RANGO
+                    print("🚫 RANGO bloqueado: " + symbol + " " + direction)
+                    continue
+                elif MODO_RANGO_REVERSION:
+                    # Opción 4: solo reversiones con RSI extremo + precio en BB extremo
+                    rsi_extremo_rango = (direction == "LONG"  and rsi <= (100 - RSI_EXTREME)) or \
+                                        (direction == "SHORT" and rsi >= RSI_EXTREME)
+                    try:
+                        _bb_std  = df["close"].iloc[-20:].std()
+                        _bb_mean = df["close"].iloc[-20:].mean()
+                        bb_sup   = _bb_mean + 2 * _bb_std
+                        bb_inf   = _bb_mean - 2 * _bb_std
+                        en_bb_inf = price <= bb_inf * 1.005   # dentro del 0.5% de BB inferior
+                        en_bb_sup = price >= bb_sup * 0.995   # dentro del 0.5% de BB superior
+                    except:
+                        en_bb_inf = en_bb_sup = False
+                    valido_rango = (direction == "LONG"  and rsi_extremo_rango and en_bb_inf) or \
+                                   (direction == "SHORT" and rsi_extremo_rango and en_bb_sup)
+                    if not valido_rango:
+                        continue
+                    condicion_mercado = "RANGO"
+                else:
+                    # Comportamiento legacy v4.5: extremos S/R al 1.5%
+                    cerca_soporte     = abs(price - sup) / price <= 0.015
+                    cerca_resistencia = abs(price - res) / price <= 0.015
+                    if direction == "LONG"  and not cerca_soporte:    continue
+                    if direction == "SHORT" and not cerca_resistencia: continue
+                    condicion_mercado = "RANGO"
 
             # 0b. Filtro de volatilidad extrema — v4.4
             # Si las últimas 4 velas tienen ATR% promedio > 3.5%, el activo está
@@ -1927,7 +1992,11 @@ def analyze_symbol(symbol, interval):
                 score_minimo = max(score_minimo, 9)
             if score < score_minimo: continue
 
-            # 14. Cooldown — verificar ANTES de agregar al resultado
+            # 14. Cooldown SL extendido — Opción 3 (v5.0)
+            # Bloquea el activo completo (ambas direcciones) si tuvo SL reciente
+            if en_cooldown_sl(symbol): continue
+
+            # 15. Cooldown normal — verificar ANTES de agregar al resultado
             if ya_alerte(symbol, direction, interval): continue
 
             # ── SL / TPs ─────────────────────────────────────────────────────
@@ -2045,7 +2114,7 @@ def scan_all():
 
     all_setups = filtrar_correlacion(all_setups)
 
-    msg  = "🔍 <b>SCANNER v4.3 — " + now + "</b>\n"
+    msg  = "🔍 <b>SCANNER v5.0 — " + now + "</b>\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
     msg += "📋 Activos: " + str(len(SYMBOLS)) + " x 2 TF | Setups: " + str(len(all_setups)) + "\n"
     msg += "⚙️ Score mín: " + str(MIN_SCORE) + "/10 | Cooldown: " + str(ALERTA_COOLDOWN_MIN) + "min\n"
@@ -2339,18 +2408,18 @@ def resumen_diario():
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Bot Scanner Crypto v4.5 iniciado...")
+    print("Bot Scanner Crypto v5.0 iniciado...")
     init_db_pool()  # Inicializar pool de conexiones primero
     init_db()
     send_telegram(
-        "<b>🤖 Bot Scanner Crypto v4.5 ACTIVO</b>\n\n"
-        "✅ Novedades v4.5:\n"
-        "— Entradas en rango habilitadas (extremos S/R)\n"
-        "— Filtros HTF/BTC relajados en modo rango\n"
-        "— Bonus +1 score en extremo de rango confirmado\n"
-        "— Fix np.float64 trailing stop\n\n"
+        "<b>🤖 Bot Scanner Crypto v5.0 ACTIVO</b>\n\n"
+        "✅ Novedades v5.0:\n"
+        "— 🚫 Bloqueo duro de señales en RANGO\n"
+        "— ⏳ Cooldown 3h por activo tras SL\n"
+        "— 🔄 Modo RANGO_REVERSION listo (activar tras backtest)\n\n"
         "⚙️ Score mínimo: " + str(MIN_SCORE) + "/10\n"
-        "⏱ Cooldown: " + str(ALERTA_COOLDOWN_MIN) + " minutos\n"
+        "⏱ Cooldown normal: " + str(ALERTA_COOLDOWN_MIN) + " minutos\n"
+        "⏱ Cooldown post-SL: " + str(COOLDOWN_SL_MIN) + " minutos\n"
         "🔄 Escaneo cada 5 minutos\n\n"
         "💬 Comandos: /resumen | /scan | /backtest | /ayuda"
     )
